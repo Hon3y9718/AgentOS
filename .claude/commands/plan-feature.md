@@ -1,0 +1,1 @@
+"Read docs/ARCHITECTURE.md and API_CONTRACT.md. For feature $ARGUMENTS, produce a plan: files touched, schema changes, tests to write. Do not write code."

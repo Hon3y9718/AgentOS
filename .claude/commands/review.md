@@ -1,0 +1,1 @@
+"Review the current diff against the rules in CLAUDE.md. Flag layering violations specifically."

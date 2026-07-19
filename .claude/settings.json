@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make *)", "Bash(pytest *)", "Bash(ruff *)",
+      "Bash(git status)", "Bash(git diff *)", "Bash(uv *)"
+    ],
+    "deny": ["Bash(rm -rf *)", "Read(./.env)"]
+  }
+}
