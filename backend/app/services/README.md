@@ -3,11 +3,19 @@
 Orchestration, transactions, decisions (ARCHITECTURE.md). `conversations.py`
 (CRUD, §5.2), `messages.py` (list + truncate-delete, §5.3), `chat.py` (the
 core turn, §5.4 *and* §5.5 — both non-streaming and streaming),
-`idempotency.py` (§5.4's Idempotency-Key store), and `models.py` (§4 — the
-one module here with no DB session at all, since the registry it filters
-is static and in-memory) are real; `titling.py`, `tools.py`, `files.py`
-don't exist yet. `messages.py`'s `row_to_schema()` is exported (not
-`_`-prefixed) specifically so `chat.py` can reuse it.
+`idempotency.py` (§5.4's Idempotency-Key store), `models.py` (§4 — the one
+module here with no DB session at all, since the registry it filters is
+in-memory), and `users.py` (the per-user token usage quota, §1) are real;
+`titling.py`, `tools.py`, `files.py` don't exist yet. `messages.py`'s
+`row_to_schema()` is exported (not `_`-prefixed) specifically so `chat.py`
+can reuse it.
+
+Account creation/login itself is **not** here — it's fastapi-users library
+logic composed in `app/core/auth/` and `app/api/v1/auth.py`, since it's
+inherently framework-coupled in a way this package's no-fastapi-import rule
+forbids. `users.py` is only the domain logic that feature needed
+(check/increment token usage) — see `app/core/auth/README.md` and
+`docs/DECISIONS/0003 Auth Layering.md`.
 
 `chat.py` exports four entry points, not one — `create_chat_message()` for
 the JSON response; `prepare_stream()` + `emit_stream()`, always called as a

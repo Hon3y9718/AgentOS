@@ -31,9 +31,10 @@ those three, not here.
 | 3. Conversations CRUD (service + router) | ✅ done |
 | 4. Provider abstraction (`core/llm`, registry, first adapter) | ✅ done |
 | 5. Chat endpoint (the core streamed turn) | ✅ done |
-| 6. Remaining providers, tools, files, titling | 🟡 in progress — 4 adapters + live model discovery + per-turn picker done; gemini adapter, tools, files, titling, cancellation remain |
-| 7. Frontend (Streamlit MVP) | ✅ done |
+| 6. Remaining providers, tools, files, titling | 🟡 in progress — 4 adapters + live model discovery + Settings-based picker done; gemini adapter, tools, files, titling, cancellation remain |
+| 7. Frontend (Streamlit MVP) | ✅ done — real login/signup UI, see auth section below |
 | 8. Test coverage (contract fixtures, live smoke) | ⬜ not started |
+| 9. Real auth (email/password, JWT) + per-user token limits | ✅ done |
 
 ## Recommended order
 
@@ -63,6 +64,9 @@ next slice and unblocks the frontend's conversation list early.
 7. **Tools, files, titling, cancellation** — round out the contract. (Idempotency moved
    to item 4 above — done.)
 8. **Test coverage** — contract fixtures per provider, live smoke suite.
+9. ~~**Real auth + per-user token limits**~~ Done 2026-07-21 — see BUILD_LOG and
+   `docs/DECISIONS/0003 Auth Layering.md`. Pulled forward ahead of items 7/8 on
+   direct request, out of the "recommended order"'s original sequencing.
 
 ---
 
@@ -71,8 +75,9 @@ next slice and unblocks the frontend's conversation list early.
 ### Cross-cutting / gaps flagged during exploration
 - [x] `docs/DECISIONS/0002 Provider Abstraction.md` — written alongside the Anthropic
       adapter, per plan. Six numbered decisions; read before touching `core/llm/`.
-- [ ] Real `users` table + FK from `conversations.user_id` (currently unconstrained,
-      per BUILD_LOG's persistence-layer session).
+- [x] Real `users` table + FK from `conversations.user_id`/`idempotency_keys.user_id` —
+      done 2026-07-21 alongside real auth, see BUILD_LOG and
+      `docs/DECISIONS/0003 Auth Layering.md`.
 - [ ] Auto-run `alembic upgrade head` on container startup (currently manual).
 - [ ] uvicorn's own access/startup logs still aren't JSON (needs a custom `log_config`
       passed to uvicorn — app-level structlog output already is).
@@ -204,21 +209,30 @@ next slice and unblocks the frontend's conversation list early.
 - [ ] `GET /api/v1/tools`
 - [ ] `POST /api/v1/conversations/{id}/tool_results`
 - [ ] `POST /api/v1/files`
-- [x] `get_current_user` dependency — MVP stub per §1 (`app/api/v1/deps.py`); real
-      token verification is still deferred, only the Bearer-header shape is real
+- [x] `get_current_user` dependency — real JWT verification via `app.core.auth`, done
+      2026-07-21 (was the MVP stub; see BUILD_LOG and ADR-0003).
+- [x] `POST /api/v1/auth/register`, `/login`, `/logout` — done 2026-07-21, composes
+      fastapi-users' own routers rather than hand-written thin handlers (ADR-0003).
 - [ ] Rate-limit headers + `X-Params-Dropped` / `X-Request-Id` wiring (§6)
+- [x] **Frontend login/signup UI** — done 2026-07-21, see BUILD_LOG. Was flagged here as
+      a gap right after the backend auth slice landed; closed the same day.
+- [ ] **Newly discovered:** no self-service way to raise a user's `token_limit` — an
+      operator has to update the `users` row directly (no admin endpoint exists).
 
 ### Frontend (Streamlit MVP)
 - [x] `api_client.py` — the only file allowed to talk HTTP to the backend. Sync `httpx`
       (Streamlit's execution model is sync — no asyncio needed). Config via
-      `AGENTOS_API_BASE_URL`/`AGENTOS_API_TOKEN` env vars, not a `config.py` module — that
-      rule is `backend/app/`-scoped (`check_layering.sh` only greps that path).
-      `create_conversation(default_model=...)` takes the model as a parameter instead
-      of hardcoding it — `DEFAULT_MODEL` is only the initial pre-selection before
-      Settings' first `list_models()` call returns. `stream_chat_message(..., model=...)`
-      sends the model as a required per-turn override (`ChatRequest.model`, §5.4) —
-      nothing PATCHes a conversation's `default_model` anymore; the choice is per-turn,
-      not per-conversation.
+      `AGENTOS_API_BASE_URL` env var, not a `config.py` module — that rule is
+      `backend/app/`-scoped (`check_layering.sh` only greps that path). Every function
+      except `register()`/`login()` takes an explicit `token: str` now (real per-account
+      JWTs, done 2026-07-21) — the old shared `AGENTOS_API_TOKEN` env var / module-level
+      `_AUTH_HEADERS` constant are gone; see BUILD_LOG and ADR-0003.
+      `create_conversation(token, default_model=...)` takes the model as a parameter
+      instead of hardcoding it — `DEFAULT_MODEL` is only the initial pre-selection
+      before Settings' first `list_models()` call returns. `stream_chat_message(token,
+      ..., model=...)` sends the model as a required per-turn override
+      (`ChatRequest.model`, §5.4) — nothing PATCHes a conversation's `default_model`
+      anymore; the choice is per-turn, not per-conversation.
 - [x] Settings page + provider/model selection — Done 2026-07-21, see BUILD_LOG.
       `st.navigation`/`st.Page` (Streamlit 1.36+) splits the app into "Chat" and
       "Settings"; provider (default **groq**, per explicit instruction) and model are
@@ -243,7 +257,10 @@ next slice and unblocks the frontend's conversation list early.
       the model list and picks a sensible default; a real send after switching to
       Anthropic surfaced a genuine "credit balance too low" error from Anthropic's own
       API (an account/billing issue, not a bug) — still confirms real routing.
-- [x] `app.py` — sidebar conversation list (with delete) + "New conversation", chat
+- [x] `app.py` — login/signup screen (tabs, done 2026-07-21) gating everything below it,
+      including `st.navigation` itself, until `st.session_state.access_token` is set;
+      sidebar conversation list (with delete) + "New conversation" + logout (shown on
+      both Chat and Settings pages via a shared `_render_account_sidebar()`), chat
       history via `list_messages`, `st.chat_input` → `st.write_stream` fed by parsed SSE
       events, client-side-only title placeholder (`title: null` → "New conversation",
       never persisted or invented server-side, per §5.2/§7). No pagination UI, no
@@ -299,12 +316,15 @@ next slice and unblocks the frontend's conversation list early.
 
 - Multi-step agent loops (built on `core/llm`'s `tool_use` blocks)
 - Long-running background runs (the `run_id` machinery already threads through §5.5)
-- Multi-tenancy hardening (auth dependency and user-scoping already exist from MVP day 1)
-- Cost governance and budgets
+- Multi-tenancy hardening (real auth + user-scoping now exist, see item 9 above; social
+  login / OAuth backends are the natural next step, fastapi-users supports them without
+  a redesign)
+- Cost governance and budgets — today's per-user quota (item 9) is a flat lifetime
+  counter, not a real budgeting system (no periods, no self-service tiers)
 - Provider failover and routing
 - Server-side tool execution (as opposed to MVP's client-side `tool_results`)
 
 ---
 
-*Last updated: 2026-07-21, after live model discovery (catalog + per-provider live
-fetch) and adding a Settings page for provider/model selection, keeping Chat plain.*
+*Last updated: 2026-07-21, after merging live model discovery + Settings-based
+provider/model selection with real email/password auth and per-user token limits.*

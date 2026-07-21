@@ -10,8 +10,8 @@ shapes. No `fastapi` import (ARCHITECTURE.md's layering rule) — `emit_stream`
 takes a plain `is_disconnected` callable, not a `Request` object, for exactly
 that reason.
 Called by: app/api/v1/chat.py. Calls app.services.conversations,
-app.services.messages, app.services.idempotency, app.core.llm.*,
-app.models.message, app.models.conversation, app.core.errors.
+app.services.messages, app.services.idempotency, app.services.users,
+app.core.llm.*, app.models.message, app.models.conversation, app.core.errors.
 Gotcha: `prepare_stream()` (validation, idempotency claim, persistence) and
 `emit_stream()` (frame emission) are deliberately two separate awaitables,
 not one generator. §5.5: "errors that occur before the first byte use the
@@ -64,6 +64,7 @@ from app.schemas.content_block import ContentBlock, ReasoningBlock, TextBlock, T
 from app.schemas.conversation import Conversation
 from app.services import conversations as conversations_service
 from app.services import idempotency
+from app.services import users as users_service
 from app.services.messages import row_to_schema
 
 # WHY 4096: API_CONTRACT §4's own worked example uses this as max_tokens —
@@ -114,7 +115,7 @@ async def create_chat_message(
     )
 
     try:
-        result = await _run_turn(db, entry, llm_request, user_row, assistant_row)
+        result = await _run_turn(db, user_id, entry, llm_request, user_row, assistant_row)
     except DomainError:
         await idempotency.abandon(db, key=idempotency_key)
         raise
@@ -138,6 +139,11 @@ class _FreshPlan(NamedTuple):
     """`prepare_stream()`'s result when this is a genuinely new turn."""
 
     idempotency_key: str
+    # WHY carried here, not re-derived in emit_stream: emit_stream() only
+    # receives `plan`, not the router's original user_id — this is how it
+    # learns which user's tokens_used to increment on the success path,
+    # without widening its own parameter list.
+    user_id: str
     entry: ModelEntry
     llm_request: LLMRequest
     user_row: MessageModel
@@ -179,6 +185,7 @@ async def prepare_stream(
     )
     return _FreshPlan(
         idempotency_key=idempotency_key,
+        user_id=user_id,
         entry=entry,
         llm_request=llm_request,
         user_row=user_row,
@@ -297,6 +304,9 @@ async def emit_stream(
     plan.assistant_row.stop_reason = terminal.stop_reason
     plan.assistant_row.usage = _usage_dict(terminal.usage, plan.entry)
     plan.assistant_row.completed_at = datetime.now(UTC).replace(tzinfo=None)
+    await users_service.increment_tokens_used(
+        db, plan.user_id, terminal.usage.input_tokens + terminal.usage.output_tokens
+    )
     await db.commit()
 
     result = ChatResponse(
@@ -422,6 +432,7 @@ def _replay_block_frames(index: int, block: ContentBlock) -> tuple[str, str]:
 
 async def _run_turn(
     db: AsyncSession,
+    user_id: str,
     entry: ModelEntry,
     llm_request: LLMRequest,
     user_row: MessageModel,
@@ -459,6 +470,9 @@ async def _run_turn(
     assistant_row.stop_reason = terminal.stop_reason
     assistant_row.usage = _usage_dict(terminal.usage, entry)
     assistant_row.completed_at = datetime.now(UTC).replace(tzinfo=None)
+    await users_service.increment_tokens_used(
+        db, user_id, terminal.usage.input_tokens + terminal.usage.output_tokens
+    )
     await db.commit()
     await db.refresh(assistant_row)
 
@@ -576,10 +590,21 @@ async def _validate_and_resolve(
     idempotency claim happens. Shared by both response shapes.
 
     WHY this must run before idempotency claiming: a request that was never
-    going to do real work (bad conversation, bad model, unsupported tools)
-    shouldn't claim an Idempotency-Key — only requests that actually attempt
-    the turn should be idempotency-tracked.
+    going to do real work (bad conversation, bad model, unsupported tools,
+    usage limit already exceeded) shouldn't claim an Idempotency-Key — only
+    requests that actually attempt the turn should be idempotency-tracked.
+
+    WHY a would-be idempotent replay of an already-completed (and
+    already-counted) turn is also rejected once a user is over their limit,
+    even though replaying it wouldn't consume any new tokens: this check
+    runs here, before create_chat_message()/prepare_stream() ever call
+    idempotency.check_or_claim() to find out whether the request is a
+    replay. Telling the two cases apart would mean resolving idempotency
+    before this validation step, inverting the ordering the module
+    docstring's own rule depends on. Accepted as an MVP simplification.
     """
+    await users_service.check_usage_limit(db, user_id)
+
     conversation = await conversations_service.get_conversation(db, user_id, conversation_id)
 
     if data.tools:

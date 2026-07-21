@@ -22,6 +22,18 @@ dependencies = [
     # explicit dependency shouldn't rely on another package's extras still
     # including it.
     "pyyaml>=6.0",
+    # WHY fastapi-users over hand-rolled pyjwt+argon2: register/login/JWT
+    # issuance is well-trodden ground with real security footguns (timing
+    # attacks on login, password policy, token replay) — chose a maintained
+    # library over reinventing it. Pulls in pyjwt, argon2-cffi, and
+    # email-validator transitively; see app/core/auth/README.md for how its
+    # framework-coupled pieces are kept out of app/services/.
+    "fastapi-users[sqlalchemy]>=15.0.5",
+    # WHY explicit: fastapi-users' default login route parses
+    # OAuth2PasswordRequestForm, which needs python-multipart to parse the
+    # form body — not pulled in by plain `fastapi` (only `fastapi[standard]`
+    # bundles it, which we don't use).
+    "python-multipart>=0.0.32",
 ]
 
 [dependency-groups]

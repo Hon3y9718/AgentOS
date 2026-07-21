@@ -17,11 +17,13 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
 from app.core.ids import new_id
 from app.models.message import Message as MessageModel
+from app.models.user import User as UserModel
 from app.schemas.chat import ChatRequest
 from app.schemas.content_block import TextBlock
 from app.schemas.conversation import ConversationCreate
@@ -314,6 +316,24 @@ async def test_stream_disconnect_persists_incomplete_and_cancelled(
     engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with session_factory() as db:
+        # WHY needed now: prepare_stream() calls
+        # app.services.users.check_usage_limit(), which requires a real
+        # users row for "disconnect_test_user" to query — ON CONFLICT DO
+        # NOTHING because this literal is reused across test runs against
+        # one persistent Postgres (no per-test isolation, see ROADMAP.md).
+        await db.execute(
+            pg_insert(UserModel)
+            .values(
+                id="disconnect_test_user",
+                email="disconnect_test_user@test.invalid",
+                hashed_password="unusable-test-placeholder-hash",
+                is_active=True,
+                is_superuser=False,
+                is_verified=True,
+            )
+            .on_conflict_do_nothing(index_elements=["id"])
+        )
+        await db.commit()
         conversation = await conversations_service.create_conversation(
             db, "disconnect_test_user", ConversationCreate(default_model=_MODEL)
         )

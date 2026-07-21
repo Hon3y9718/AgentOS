@@ -11,6 +11,12 @@ real title. §5.2: "Clients must handle title: null and render a
 placeholder; they must not generate titles themselves." Every conversation
 here stays untitled forever in practice — titling.py doesn't exist yet
 (blocked on a Groq adapter, per ROADMAP.md).
+Gotcha: the login/signup screen below stores the JWT in
+`st.session_state.access_token` — server-side memory tied to one browser
+tab's connection. Closing the tab or restarting this process logs everyone
+out; there is no persistent "remember me" cookie. See API_CONTRACT §1. The
+auth gate runs before `st.navigation` is even called, so neither page below
+executes at all until a token exists.
 Gotcha (2026-07-21): the model choice is a single session-global "what to
 use for the next send" value, not per-conversation — matching how
 ChatGPT/Claude's own selector behaves (opening a different existing chat
@@ -37,6 +43,10 @@ st.set_page_config(page_title="AgentOS", page_icon="💬")
 
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
+if "access_token" not in st.session_state:
+    st.session_state.access_token = None
+if "email" not in st.session_state:
+    st.session_state.email = None
 # WHY groq specifically, not the first provider alphabetically or the
 # first one returned: the user's own explicit instruction — "Default
 # provider is Groq."
@@ -44,6 +54,66 @@ if "selected_provider" not in st.session_state:
     st.session_state.selected_provider = "groq"
 if "selected_model" not in st.session_state:
     st.session_state.selected_model = None
+
+# WHY 8, matching backend/app/core/auth/manager.py's _MIN_PASSWORD_LENGTH:
+# a duplicated constant, not a shared import — frontend/ and backend/ are
+# separate apps talking over HTTP, nothing here can import backend code
+# (ARCHITECTURE.md). Catching a too-short password client-side just saves a
+# round trip; the backend's own check is still the real enforcement.
+_MIN_PASSWORD_LENGTH = 8
+
+
+def _render_auth_screen() -> None:
+    """Login/signup gate, shown instead of the chat UI until a token exists."""
+    st.title("AgentOS")
+    login_tab, signup_tab = st.tabs(["Log in", "Sign up"])
+
+    with login_tab, st.form("login_form"):
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        if st.form_submit_button("Log in", use_container_width=True):
+            try:
+                token = api_client.login(email, password)["access_token"]
+            except api_client.ApiError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state.access_token = token
+                st.session_state.email = email
+                st.rerun()
+
+    with signup_tab, st.form("signup_form"):
+        email = st.text_input("Email", key="signup_email")
+        password = st.text_input("Password", type="password", key="signup_password")
+        confirm = st.text_input("Confirm password", type="password", key="signup_confirm")
+        if st.form_submit_button("Sign up", use_container_width=True):
+            if password != confirm:
+                st.error("Passwords don't match.")
+            elif len(password) < _MIN_PASSWORD_LENGTH:
+                st.error(f"Password must be at least {_MIN_PASSWORD_LENGTH} characters.")
+            else:
+                try:
+                    api_client.register(email, password)
+                    # WHY log in right after registering, not asking the
+                    # user to do it themselves: register() returns the new
+                    # user's profile, not a token (API_CONTRACT §1.1) — a
+                    # second call is the only way to get one, and doing it
+                    # here means "sign up" actually lands the user in the
+                    # app instead of back at a login form they just filled
+                    # the same credentials into.
+                    token = api_client.login(email, password)["access_token"]
+                except api_client.ApiError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state.access_token = token
+                    st.session_state.email = email
+                    st.rerun()
+
+
+if st.session_state.access_token is None:
+    _render_auth_screen()
+    st.stop()
+
+token = st.session_state.access_token
 
 
 def _display_title(conversation: dict) -> str:
@@ -76,7 +146,7 @@ def _render_content(content: list[dict]) -> None:
 
 def _load_models() -> list[dict]:
     try:
-        return api_client.list_models()["data"]
+        return api_client.list_models(token)["data"]
     except api_client.ApiError as exc:
         st.error(f"Couldn't load models: {exc}")
         return []
@@ -108,20 +178,41 @@ def _sync_selected_model(models: list[dict]) -> None:
         st.session_state.selected_model = None
 
 
+def _render_account_sidebar() -> None:
+    """Email + logout — shown at the top of the sidebar on every page, not
+    just Chat, so logging out doesn't require navigating back first."""
+    st.title("AgentOS")
+    st.caption(st.session_state.email)
+    if st.button("Log out", use_container_width=True):
+        # WHY conversation_id is cleared too, not just access_token/email:
+        # a second account logging in on this same browser tab would
+        # otherwise start with a stale conversation id it doesn't own —
+        # the API's ownership check would just 404 it (never leaking whose
+        # it was), but it's a confusing dead end rather than the clean "no
+        # conversation selected" state a fresh login should show.
+        st.session_state.access_token = None
+        st.session_state.email = None
+        st.session_state.conversation_id = None
+        st.rerun()
+    st.divider()
+
+
 def _chat_page() -> None:
     models = _load_models()
     models_by_id = {m["id"]: m for m in models}
     _sync_selected_model(models)
 
     with st.sidebar:
-        st.title("AgentOS")
+        _render_account_sidebar()
 
         if st.button(
             "+ New conversation",
             use_container_width=True,
             disabled=st.session_state.selected_model is None,
         ):
-            created = api_client.create_conversation(default_model=st.session_state.selected_model)
+            created = api_client.create_conversation(
+                token, default_model=st.session_state.selected_model
+            )
             st.session_state.conversation_id = created["id"]
             st.rerun()
 
@@ -133,7 +224,7 @@ def _chat_page() -> None:
             # placeholder handling") — the default page (20, newest first)
             # is enough to exercise the backend end-to-end, which is this
             # slice's actual goal.
-            conversations = api_client.list_conversations()["data"]
+            conversations = api_client.list_conversations(token)["data"]
         except api_client.ApiError as exc:
             st.error(f"Couldn't load conversations: {exc}")
             conversations = []
@@ -155,7 +246,7 @@ def _chat_page() -> None:
                     st.rerun()
             with col_delete:
                 if st.button("🗑️", key=f"delete_{conversation['id']}"):
-                    api_client.delete_conversation(conversation["id"])
+                    api_client.delete_conversation(token, conversation["id"])
                     if is_selected:
                         st.session_state.conversation_id = None
                     st.rerun()
@@ -173,7 +264,7 @@ def _chat_page() -> None:
     conversation_id = st.session_state.conversation_id
 
     try:
-        messages = api_client.list_messages(conversation_id)["data"]
+        messages = api_client.list_messages(token, conversation_id)["data"]
     except api_client.ApiError as exc:
         if exc.status_code == 404:
             # WHY reset instead of just showing the error: the selected
@@ -228,7 +319,7 @@ def _chat_page() -> None:
 
             def _text_chunks():
                 for event in api_client.stream_chat_message(
-                    conversation_id, prompt, model=selected_model
+                    token, conversation_id, prompt, model=selected_model
                 ):
                     name, data = event["event"], event["data"]
                     if name == "content_block_delta" and data["delta"]["type"] == "text_delta":
@@ -258,6 +349,9 @@ def _chat_page() -> None:
 
 
 def _settings_page() -> None:
+    with st.sidebar:
+        _render_account_sidebar()
+
     st.title("Settings")
     st.caption("Preferences for this browser session only — nothing here is saved server-side.")
 

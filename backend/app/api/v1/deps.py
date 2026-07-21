@@ -1,39 +1,34 @@
-"""Auth dependency — MVP stub (API_CONTRACT.md §1).
+"""Auth dependency (API_CONTRACT.md §1).
 
-Role: resolves the request's user from the Authorization header. Real
-dependency, fake resolution — every route already goes through this so
-swapping in real token verification later touches one file.
-Called by: app/api/v1/conversations.py (and every future authenticated router).
-Calls app.core.errors.
-Gotcha: the token's value is never checked in MVP — only that a Bearer header
-is present — so this must not be mistaken for real authentication.
+Role: resolves the request's user from the Authorization header. Every route
+already goes through this — real token verification (fastapi-users' JWT
+strategy, app.core.auth) swapped in behind this one function, exactly as the
+MVP stub's original docstring anticipated.
+Called by: app/api/v1/conversations.py, messages.py, chat.py (every
+authenticated router).
+Calls app.core.auth.users.
+Gotcha: a missing/invalid/expired Bearer token raises a bare
+fastapi.HTTPException(401), not our DomainError — main.py's
+http_exception_handler is what turns it into the §2 envelope, not this file.
 See: docs/API_CONTRACT.md#1-authentication
 """
 
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends
 
-from app.core.errors import UnauthenticatedError
-
-# WHY a fixed constant, not a row in a (nonexistent) users table: §1's MVP
-# auth resolves every token to one development user. Real multi-user auth
-# swaps this function's body, not its signature or callers.
-DEV_USER_ID = "user_dev"
+from app.core.auth.users import current_active_user
+from app.models.user import User
 
 
-async def get_current_user(authorization: str | None = Header(default=None)) -> str:
-    """Resolve the caller's user ID from the Authorization header.
+async def get_current_user(user: Annotated[User, Depends(current_active_user)]) -> str:
+    """Resolve the caller's user ID from a verified Bearer JWT.
 
     Raises:
-        UnauthenticatedError: header missing or not a Bearer token.
+        fastapi.HTTPException: 401, via app.core.auth.users.current_active_user
+            — missing, malformed, expired, or otherwise unresolvable token.
     """
-    if authorization is None or not authorization.startswith("Bearer "):
-        raise UnauthenticatedError(
-            "Missing or malformed Authorization header.",
-            code="auth.missing_bearer_token",
-        )
-    return DEV_USER_ID
+    return user.id
 
 
 # WHY an Annotated alias, not `Depends(get_current_user)` inline at each call

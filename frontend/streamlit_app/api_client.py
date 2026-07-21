@@ -6,9 +6,12 @@ frontend/streamlit_app/api_client.py and nowhere else"). app.py calls these
 functions and never touches httpx or the wire format directly.
 Called by: frontend/streamlit_app/app.py. Calls nothing internal — this is
 the frontend's own leaf, talking only to the backend over HTTP.
-Gotcha: MVP auth (API_CONTRACT §1) accepts any Bearer token and resolves it
-to one fixed dev user — AGENTOS_API_TOKEN below is not a real credential,
-just a value satisfying the "Bearer <token>" shape.
+Gotcha: auth (API_CONTRACT §1) is real now — every function below except
+`register`/`login` takes an explicit `token: str` (the JWT from a prior
+`login()` call, held in app.py's `st.session_state`), not a shared
+module-level constant. There is deliberately no module-level "current
+token" anymore: this process serves every browser tab that connects to it,
+and a module constant would leak one user's token to all of them.
 See: docs/API_CONTRACT.md
 """
 
@@ -26,16 +29,14 @@ import httpx
 # equivalent, and CLAUDE.md calls Streamlit disposable, not worth building
 # one for a client getting replaced by Next.js.
 API_BASE_URL = os.getenv("AGENTOS_API_BASE_URL", "http://localhost:8000")
-API_TOKEN = os.getenv("AGENTOS_API_TOKEN", "dev-token")
 # WHY still a hardcoded fallback, even though GET /api/v1/models exists now:
-# app.py's model selector needs *some* pre-selected value before its first
+# app.py's Settings page needs *some* pre-selected value before its first
 # call to that endpoint returns — this is only the initial choice, not a
 # ceiling on what's selectable. A conversation created with no
 # default_model fails its first message with invalid_request ("no model
 # specified"), so the UI must always send one.
 DEFAULT_MODEL = "anthropic:claude-sonnet-4-5"
 
-_AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 # WHY a longer read timeout just for the chat call: a model turn can
 # legitimately take longer than a normal CRUD request; §6's own stream idle
@@ -58,24 +59,54 @@ def _raise_for_error(response: httpx.Response) -> None:
         raise ApiError(response.status_code, response.json())
 
 
-def list_models() -> dict[str, Any]:
+def _auth_headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def register(email: str, password: str) -> dict[str, Any]:
+    """POST /api/v1/auth/register (§1.1). No auth header — this is how one
+    is obtained in the first place. Raises ApiError(409) for an
+    already-registered email, ApiError(422) for a too-short password."""
+    with httpx.Client(base_url=API_BASE_URL, timeout=_DEFAULT_TIMEOUT) as client:
+        response = client.post("/api/v1/auth/register", json={"email": email, "password": password})
+    _raise_for_error(response)
+    return response.json()
+
+
+def login(email: str, password: str) -> dict[str, Any]:
+    """POST /api/v1/auth/login (§1.1). Raises ApiError(401) for a wrong
+    email/password.
+
+    WHY `data=`, not `json=` like every other call in this file: this one
+    endpoint takes `application/x-www-form-urlencoded`
+    (OAuth2PasswordRequestForm — field named `username` even though it
+    holds the email), the standard OAuth2 password grant shape, not this
+    API's usual JSON. See API_CONTRACT §1.1.
+    """
+    with httpx.Client(base_url=API_BASE_URL, timeout=_DEFAULT_TIMEOUT) as client:
+        response = client.post("/api/v1/auth/login", data={"username": email, "password": password})
+    _raise_for_error(response)
+    return response.json()
+
+
+def list_models(token: str) -> dict[str, Any]:
     """GET /api/v1/models (§4) — every registered model, with `available`
     reflecting whether that provider's API key is configured server-side."""
     with httpx.Client(
-        base_url=API_BASE_URL, headers=_AUTH_HEADERS, timeout=_DEFAULT_TIMEOUT
+        base_url=API_BASE_URL, headers=_auth_headers(token), timeout=_DEFAULT_TIMEOUT
     ) as client:
         response = client.get("/api/v1/models")
     _raise_for_error(response)
     return response.json()
 
 
-def list_conversations(*, cursor: str | None = None, limit: int = 20) -> dict[str, Any]:
+def list_conversations(token: str, *, cursor: str | None = None, limit: int = 20) -> dict[str, Any]:
     """GET /api/v1/conversations (§5.2), newest first."""
     params: dict[str, Any] = {"limit": limit}
     if cursor:
         params["cursor"] = cursor
     with httpx.Client(
-        base_url=API_BASE_URL, headers=_AUTH_HEADERS, timeout=_DEFAULT_TIMEOUT
+        base_url=API_BASE_URL, headers=_auth_headers(token), timeout=_DEFAULT_TIMEOUT
     ) as client:
         response = client.get("/api/v1/conversations", params=params)
     _raise_for_error(response)
@@ -83,12 +114,12 @@ def list_conversations(*, cursor: str | None = None, limit: int = 20) -> dict[st
 
 
 def create_conversation(
-    *, title: str | None = None, default_model: str = DEFAULT_MODEL
+    token: str, *, title: str | None = None, default_model: str = DEFAULT_MODEL
 ) -> dict[str, Any]:
     """POST /api/v1/conversations (§5.2). `title` stays null until the
     first exchange completes server-side — see §5.2's client obligation."""
     with httpx.Client(
-        base_url=API_BASE_URL, headers=_AUTH_HEADERS, timeout=_DEFAULT_TIMEOUT
+        base_url=API_BASE_URL, headers=_auth_headers(token), timeout=_DEFAULT_TIMEOUT
     ) as client:
         response = client.post(
             "/api/v1/conversations", json={"title": title, "default_model": default_model}
@@ -97,29 +128,31 @@ def create_conversation(
     return response.json()
 
 
-def delete_conversation(conversation_id: str) -> None:
+def delete_conversation(token: str, conversation_id: str) -> None:
     """DELETE /api/v1/conversations/{id} (§5.2), soft delete server-side."""
     with httpx.Client(
-        base_url=API_BASE_URL, headers=_AUTH_HEADERS, timeout=_DEFAULT_TIMEOUT
+        base_url=API_BASE_URL, headers=_auth_headers(token), timeout=_DEFAULT_TIMEOUT
     ) as client:
         response = client.delete(f"/api/v1/conversations/{conversation_id}")
     _raise_for_error(response)
 
 
-def list_messages(conversation_id: str, *, cursor: str | None = None) -> dict[str, Any]:
+def list_messages(token: str, conversation_id: str, *, cursor: str | None = None) -> dict[str, Any]:
     """GET .../messages (§5.3), chronological (the API's own default order)."""
     params: dict[str, Any] = {}
     if cursor:
         params["cursor"] = cursor
     with httpx.Client(
-        base_url=API_BASE_URL, headers=_AUTH_HEADERS, timeout=_DEFAULT_TIMEOUT
+        base_url=API_BASE_URL, headers=_auth_headers(token), timeout=_DEFAULT_TIMEOUT
     ) as client:
         response = client.get(f"/api/v1/conversations/{conversation_id}/messages", params=params)
     _raise_for_error(response)
     return response.json()
 
 
-def stream_chat_message(conversation_id: str, text: str, *, model: str) -> Iterator[dict[str, Any]]:
+def stream_chat_message(
+    token: str, conversation_id: str, text: str, *, model: str
+) -> Iterator[dict[str, Any]]:
     """Send one user turn and yield parsed SSE events (§5.4, §5.5).
 
     WHY yielding the raw parsed {event, data} pairs, not just extracted text
@@ -133,7 +166,7 @@ def stream_chat_message(conversation_id: str, text: str, *, model: str) -> Itera
     previous one, so a new key is correct here specifically.
 
     WHY `model` is a required per-call param, not read from the
-    conversation's own default_model (2026-07-21 update): the model picker
+    conversation's own default_model (2026-07-21 update): the model choice
     is now per-turn, not per-conversation — each send can use a different
     model, via this same `ChatRequest.model` override field §5.4 already
     documents. The conversation's default_model is now just its initial
@@ -142,7 +175,7 @@ def stream_chat_message(conversation_id: str, text: str, *, model: str) -> Itera
     idempotency_key = str(uuid.uuid4())
     payload = {"content": [{"type": "text", "text": text}], "model": model}
     headers = {
-        **_AUTH_HEADERS,
+        **_auth_headers(token),
         "Idempotency-Key": idempotency_key,
         "Accept": "text/event-stream",
     }

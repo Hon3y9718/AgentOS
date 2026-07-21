@@ -1,17 +1,19 @@
 """Conversations CRUD (API_CONTRACT.md §5.2).
 
 Gotcha: "another user's conversation" is created by calling the service
-directly with a different user_id, not through the API — the MVP auth stub
-(app/api/v1/deps.py) resolves every Bearer token to the same dev user, so
-there is no way to *authenticate* as a second user yet.
+directly with a different user_id, not through the API — this repo's tests
+don't bother spinning up a second real registered account for these
+ownership-scoping checks, only a bare row satisfying the users.id FK.
 """
 
 import asyncio
 
 from fastapi.testclient import TestClient
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
+from app.models.user import User as UserModel
 from app.schemas.conversation import Conversation, ConversationCreate
 from app.services import conversations as service
 
@@ -30,6 +32,25 @@ def _create_conversation_for_user(user_id: str) -> Conversation:
         engine = create_async_engine(settings.database_url)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         async with session_factory() as db:
+            # WHY ON CONFLICT DO NOTHING, not a plain insert: conversations.
+            # user_id now FKs to users.id (this feature's migration) — this
+            # helper is called with the same literal user_id (e.g.
+            # "some_other_user") from multiple tests sharing one persistent
+            # Postgres (no per-test isolation, see ROADMAP.md), so a second
+            # call must not fail on a duplicate users.id/email.
+            await db.execute(
+                pg_insert(UserModel)
+                .values(
+                    id=user_id,
+                    email=f"{user_id}@test.invalid",
+                    hashed_password="unusable-test-placeholder-hash",
+                    is_active=True,
+                    is_superuser=False,
+                    is_verified=True,
+                )
+                .on_conflict_do_nothing(index_elements=["id"])
+            )
+            await db.commit()
             result = await service.create_conversation(db, user_id, ConversationCreate())
         await engine.dispose()
         return result

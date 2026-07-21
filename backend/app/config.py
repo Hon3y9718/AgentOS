@@ -23,6 +23,17 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str
+    # WHY required, no default, like database_url (not Optional like the
+    # provider keys below): a missing signing secret must crash startup, not
+    # silently issue tokens no one can later verify were signed with the
+    # value the operator intended. Reused for JWT signing AND fastapi-users'
+    # reset-password/verification token secrets (app/core/auth/manager.py) —
+    # those two flows aren't exposed by any endpoint yet, but
+    # BaseUserManager requires the properties to exist regardless. One
+    # secret for three purposes is an MVP simplification; split them if
+    # password reset ever ships for real, so rotating one doesn't invalidate
+    # the others.
+    secret_key: str
     # WHY default here but not on database_url: local dev shouldn't need a value
     # to get readable console output; prod sets LOG_LEVEL explicitly.
     log_level: str = "INFO"

@@ -23,7 +23,7 @@ from app.db.base import Base
 # Importing these registers their tables on Base.metadata before autogenerate
 # runs below. A model module that's never imported here is invisible to
 # `alembic revision --autogenerate`, even though it inherits Base.
-from app.models import conversation, idempotency_key, message  # noqa: F401
+from app.models import conversation, idempotency_key, message, user  # noqa: F401
 
 # WHY set here rather than in alembic.ini: the URL comes from app.config (the
 # one place config is allowed to live), not a second copy hardcoded in an ini

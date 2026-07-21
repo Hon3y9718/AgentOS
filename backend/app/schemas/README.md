@@ -1,9 +1,15 @@
 # schemas/
 
 Wire format in and out (ARCHITECTURE.md). `conversation.py`, `message.py`,
-`content_block.py`, `pagination.py`, `chat.py` (§5.4), and `model.py` (§4)
-are real. No schema for the error envelope yet — it's still hand-assembled
-where it's used (`app/main.py`'s `domain_error_handler`).
+`content_block.py`, `pagination.py`, `chat.py` (§5.4), `model.py` (§4), and
+`user.py` (§1) are real. No schema for the error envelope yet — it's still
+hand-assembled where it's used (`app/main.py`'s `domain_error_handler`).
+
+`user.py` is the one exception to "match the JSON shape field-for-field,
+don't invent names" below — `UserRead`/`UserCreate` extend fastapi_users'
+own `schemas.BaseUser`/`BaseUserCreate` rather than being defined from
+scratch, since fastapi-users' own routers (`app/api/v1/auth.py`) construct
+and consume them directly. See its own module docstring.
 
 ## What lives here
 

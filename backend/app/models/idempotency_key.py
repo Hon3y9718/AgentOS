@@ -13,7 +13,7 @@ See: docs/API_CONTRACT.md#54-chat--the-core-endpoint
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import ForeignKey, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,7 +30,7 @@ class IdempotencyKey(Base):
     # across two different users is practically impossible (client-generated
     # UUIDs): a lookup that ignores user_id would let one user probe for or
     # replay another user's cached response by guessing their key.
-    user_id: Mapped[str] = mapped_column(index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     conversation_id: Mapped[str]
     # WHY a hash, not the raw body: the raw request body isn't needed after
     # the fact — only whether a replay's body matches the original well

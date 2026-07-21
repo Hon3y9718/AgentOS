@@ -1908,3 +1908,217 @@ frontend-only session) re-confirmed clean throughout.
 
 - Nothing new. Same backlog as the previous entry — this was a direct,
   immediate follow-up request, not a move down the roadmap.
+
+---
+
+## 2026-07-21 — Real email/password auth + per-user token usage limits
+
+Replaced the MVP auth stub (`get_current_user` always resolving to a
+constant `DEV_USER_ID`) with real accounts: register/login/logout, JWT
+bearer tokens, a real `users` table with FKs from `conversations.user_id`
+and `idempotency_keys.user_id`, and a flat per-user token quota enforced in
+the chat turn flow. This was always the plan — `deps.py`'s own docstring
+said swapping in real verification should touch one file, and both FK
+columns were left unconstrained on purpose, waiting for exactly this.
+
+### Decisions
+
+1. **Library: `fastapi-users[sqlalchemy]`**, chosen over hand-rolled
+   `pyjwt`+`argon2-cffi` — explicit user choice, made after being asked
+   (CLAUDE.md: never add a dependency without asking). Pulls in `pyjwt`,
+   `argon2-cffi`, and `email-validator` transitively; only `python-multipart`
+   needed adding explicitly (fastapi-users' login route parses
+   `OAuth2PasswordRequestForm`, which plain `fastapi` — not
+   `fastapi[standard]` — doesn't bundle).
+2. **Where the library's wiring lives, and how its errors reach the
+   client** — both settled in `docs/DECISIONS/0003 Auth Layering.md`, not
+   repeated here. Short version: a new `app/core/auth/` package (not
+   `app/services/`, which must never import `fastapi`); `app/main.py` gained
+   a second exception handler bridging fastapi-users' `HTTPException`s into
+   the §2 envelope, falling through to FastAPI's default handling for
+   anything it doesn't recognize (so Starlette's own 404/405 are untouched).
+3. **Token strategy: stateless JWT**, 1-hour lifetime, no revocation list —
+   user choice. `POST /auth/logout` is real (requires a valid token) but is
+   a no-op against the backend; it only matters if a cookie transport is
+   ever added.
+4. **Usage limit: flat `token_limit`/`tokens_used` columns on `users`**, no
+   reset period — user choice. Checked in
+   `app/services/chat.py`'s `_validate_and_resolve()` (before the
+   idempotency claim, same rule as the existing bad-conversation/bad-model
+   checks there), incremented atomically (`UPDATE ... SET tokens_used =
+   tokens_used + :n`, not a Python read-modify-write) on each turn's
+   success-path commit, in both the streaming and non-streaming code paths.
+   New error type `usage_limit_exceeded`, `402`, non-retryable — didn't fit
+   `permission_denied` (user IS permitted) or `rate_limited` (implies a
+   cadence/retry window that doesn't exist here).
+5. **User IDs use this repo's `new_id("user")` convention**, not
+   fastapi-users' default UUID — `SQLAlchemyBaseUserTable[str]` is
+   ID-type-agnostic by design (its `id` column is only declared under
+   `TYPE_CHECKING`), so overriding it was a one-line `mapped_column`, not a
+   fight with the library.
+6. **Migration backfill instead of truncation.** The two originally-planned
+   migrations (create `users`, then add the FKs) turned out to be one —
+   autogenerate diffed both at once since the DB had never seen an
+   intermediate state. The dev Postgres already had ~1,100 rows under three
+   stub `user_id` literals (`user_dev`, `some_other_user`,
+   `disconnect_test_user` — all test/dev artifacts, no real data). Rather
+   than truncating `conversations`/`messages`/`idempotency_keys` first (the
+   original plan's stated fallback), the migration backfills one
+   placeholder `users` row per pre-existing distinct `user_id` value via a
+   plain `INSERT ... SELECT DISTINCT ... WHERE NOT IN (SELECT id FROM
+   users)` before adding the FK constraints — non-destructive, and it also
+   means old code still writing `user_id="user_dev"` keeps working against
+   the new schema without a code change. Named the FK constraints
+   explicitly (`fk_conversations_user_id_users`,
+   `fk_idempotency_keys_user_id_users`) — autogenerate's `create_foreign_key(None,
+   ...)` on an *existing* table leaves `downgrade()` with `drop_constraint(None,
+   ...)`, which fails outright; every other FK in this codebase was named by
+   Postgres at `CREATE TABLE` time instead and never hit this.
+
+### Verified
+
+`make lint` (ruff + mypy) clean. Full `make test` run against the real dev
+Postgres (already running via `docker compose up`, not started fresh this
+session): 85 passed, 1 failed. The one failure is the *pre-existing*,
+already-documented `test_chat_bumps_message_count_and_updated_at` clock-skew
+flake (ROADMAP.md's cross-cutting gaps: Postgres `func.now()` vs Python
+`datetime.now(UTC)` on two different machines — this session's sandbox has
+Postgres in a container with real, if now consistently-signed, drift against
+the host running pytest). Confirmed unrelated to this session's diff — it
+doesn't touch `_bump_conversation()` or `updated_at` at all — by reading the
+existing ROADMAP.md/BUILD_LOG.md entries describing the exact same failure
+mode from a prior session, and re-running it in isolation (still fails, same
+symptom). Manually verified the migration's backfill directly against the
+real DB (`psql`: three placeholder `users` rows appeared, `\d conversations`
+shows the named FK) rather than trusting the migration ran cleanly just
+because `alembic upgrade head` exited 0.
+
+### Understand before the next step
+
+- **The real `.env` (not `.env.example`) needs a `SECRET_KEY` line added by
+  hand before the `api` container will boot** — `app/config.py` crashes at
+  import if it's missing, same as `DATABASE_URL`. Not done automatically:
+  Claude is denied `Read` on `.env` (by design, per the scaffolding
+  session), same reason `.env`/`.env.example` reconciliation is already a
+  standing ROADMAP.md gap.
+- **A would-be idempotent replay is rejected once a user is over their
+  limit**, even though replaying an already-completed turn wouldn't consume
+  new tokens. `check_usage_limit()` runs in `_validate_and_resolve()`,
+  before `create_chat_message()`/`prepare_stream()` ever call
+  `idempotency.check_or_claim()` to learn whether the request is a replay —
+  telling the two cases apart would mean resolving idempotency first,
+  inverting the ordering the module's own "don't claim a key for work that
+  isn't going to happen" rule depends on. Accepted as an MVP simplification.
+- **The usage check-then-increment isn't atomic against itself** — two
+  concurrent turns for a user sitting exactly at their limit could both pass
+  `check_usage_limit()` before either commits its `increment_tokens_used()`.
+  The increment itself is race-safe (an atomic SQL `UPDATE`, not
+  read-modify-write), but the *check* is a separate statement/transaction
+  from the *increment* that happens much later (after the full provider
+  call completes) — nothing holds a lock across that gap. Under real
+  concurrent load a user could exceed their limit by one in-flight turn's
+  worth of tokens. Accepted for MVP; a real fix needs either a row lock
+  spanning the whole turn (expensive — turns can take a while) or a
+  reservation/compensation scheme, neither implemented here.
+- **fastapi-users' `SQLAlchemyBaseUserTable` field is `hashed_password`, not
+  `password_hash`** — worth knowing before grepping for the wrong name.
+
+### Deliberately deferred
+
+- **Frontend login UI** — `frontend/streamlit_app/api_client.py` keeps its
+  static `AGENTOS_API_TOKEN` env var; there is no login form, no per-session
+  token storage in `st.session_state`, no token refresh. That var now needs
+  to hold a real JWT (register/login once by hand, e.g. via `curl`, and
+  paste the token in) instead of an arbitrary string — out of scope for this
+  backend-focused slice, flagged in ROADMAP.md.
+- **Email verification and password reset** — `UserManager` has the
+  required secrets wired but no router exposes either flow
+  (`get_verify_router`/`get_reset_password_router` are not mounted). See
+  ADR-0003's "what this ADR deliberately leaves open."
+- **Social login / OAuth backends** — the original ask explicitly deferred
+  this; fastapi-users supports it without a redesign when it's wanted.
+- **Self-service or admin control over `token_limit`** — an operator has to
+  update the `users` row directly today; no endpoint exists to change it.
+- **Periodic quota reset / real budgeting** — `tokens_used` only ever goes
+  up; there's no monthly/period concept, matching the "simple counter, no
+  reset" decision made before writing any code.
+
+## 2026-07-21 — Streamlit login/signup screen
+
+Closed the gap the previous session flagged: the Streamlit UI now has real
+login/signup, and every backend call carries a real per-account JWT instead
+of one shared static token.
+
+### Decisions
+
+1. **`api_client.py`'s functions take an explicit `token: str` argument now**
+   (except `register()`/`login()`, which don't have one yet) — replacing the
+   module-level `_AUTH_HEADERS` constant built once from `AGENTOS_API_TOKEN`
+   at import. That constant was structurally wrong for real auth even before
+   today: one Streamlit *process* serves every browser tab that connects to
+   it, so a module-level "current token" would leak whichever user logged in
+   most recently to everyone else's tab. `AGENTOS_API_TOKEN` is removed
+   entirely, not just unused — nothing reads it anymore.
+2. **Login form and signup form are two tabs (`st.tabs`) on one screen**,
+   gating the whole app: `app.py` checks
+   `st.session_state.access_token is None` before any of the existing
+   sidebar/chat code runs, same `st.stop()` pattern the file already used
+   for "no conversation selected."
+3. **Signup auto-logs-in.** `POST /auth/register` returns the new user's
+   profile, not a token (API_CONTRACT §1.1) — asking someone to fill the
+   same email/password into a second form right after signing up would be a
+   bad first impression, so the signup handler calls `login()` immediately
+   after a successful `register()`.
+4. **Logout clears `conversation_id` too, not just the token/email.** Found
+   by tracing through what a second account logging in on the same browser
+   tab would see otherwise: `st.session_state.conversation_id` would still
+   hold the previous account's last-selected id, and the API's
+   ownership-scoped 404 (never `403`, per §1) would turn that into a
+   confusing dead end instead of the clean empty state a fresh login should
+   show.
+5. **Client-side password-length check on signup** (8 chars, matching
+   `app/core/auth/manager.py`'s `_MIN_PASSWORD_LENGTH`) — a duplicated
+   constant, not a shared import (frontend/backend are separate processes
+   over HTTP, ARCHITECTURE.md forbids the import anyway). Only saves a round
+   trip; the backend's own check is still what actually enforces it.
+
+### Verified
+
+Ran the app directly with `streamlit run app.py` against the real dev
+backend/Postgres (not `docker compose up`, to avoid rebuilding the shared
+container image mid-session) and drove it through `claude-in-chrome`: signed
+up a new account, landed logged-in with an empty conversation list, created
+a conversation, sent a message and watched it stream token-by-token (proves
+the JWT actually reaches the SSE call, not just the CRUD ones), logged out,
+logged back in with the same credentials, confirmed the conversation was
+still there. Tried a wrong password (error shown, no crash) and a duplicate
+signup email (409 surfaced as `st.error`, no crash). `ruff check`/`ruff
+format` clean on both frontend files; no automated frontend test suite
+exists yet (ROADMAP.md's pre-existing gap — `AppTest` doesn't chase
+`st.rerun()` the way a real browser does, per the prior frontend-wiring
+session's own finding), so this was real-browser verification only, same as
+that session's approach.
+
+### Understand before the next step
+
+- **`st.session_state.access_token` is server-memory, tied to one browser
+  tab's WebSocket connection to this specific Streamlit process.** Closing
+  the tab, or restarting the process (e.g. a container redeploy), logs
+  everyone out — there is no persistent cookie or refresh-token flow. Fine
+  for a disposable MVP client; would need real solving before Next.js
+  replaces this (CLAUDE.md's stated plan) if a "stay logged in" experience
+  matters there.
+- **One Streamlit process still means one shared Python process per
+  deployment**, even though tokens are now per-tab/per-account —
+  `st.session_state` is already isolated per session by Streamlit itself,
+  so this was more "the code was wrong" than "the framework can't do this."
+
+### Deliberately deferred
+
+- **Password reset / email verification UI** — no such flow exists on the
+  backend yet either (see the previous session's ADR-0003 note), so there's
+  nothing for the frontend to call.
+- **Social login buttons** — same as the backend: explicitly out of scope,
+  no UI to build until a backend OAuth flow exists.
+- **"Remember me" / persistent login across a page reload or new tab** —
+  see the session-state gotcha above; not attempted.
