@@ -1507,3 +1507,83 @@ because `alembic upgrade head` exited 0.
 - **Periodic quota reset / real budgeting** — `tokens_used` only ever goes
   up; there's no monthly/period concept, matching the "simple counter, no
   reset" decision made before writing any code.
+
+## 2026-07-21 — Streamlit login/signup screen
+
+Closed the gap the previous session flagged: the Streamlit UI now has real
+login/signup, and every backend call carries a real per-account JWT instead
+of one shared static token.
+
+### Decisions
+
+1. **`api_client.py`'s functions take an explicit `token: str` argument now**
+   (except `register()`/`login()`, which don't have one yet) — replacing the
+   module-level `_AUTH_HEADERS` constant built once from `AGENTOS_API_TOKEN`
+   at import. That constant was structurally wrong for real auth even before
+   today: one Streamlit *process* serves every browser tab that connects to
+   it, so a module-level "current token" would leak whichever user logged in
+   most recently to everyone else's tab. `AGENTOS_API_TOKEN` is removed
+   entirely, not just unused — nothing reads it anymore.
+2. **Login form and signup form are two tabs (`st.tabs`) on one screen**,
+   gating the whole app: `app.py` checks
+   `st.session_state.access_token is None` before any of the existing
+   sidebar/chat code runs, same `st.stop()` pattern the file already used
+   for "no conversation selected."
+3. **Signup auto-logs-in.** `POST /auth/register` returns the new user's
+   profile, not a token (API_CONTRACT §1.1) — asking someone to fill the
+   same email/password into a second form right after signing up would be a
+   bad first impression, so the signup handler calls `login()` immediately
+   after a successful `register()`.
+4. **Logout clears `conversation_id` too, not just the token/email.** Found
+   by tracing through what a second account logging in on the same browser
+   tab would see otherwise: `st.session_state.conversation_id` would still
+   hold the previous account's last-selected id, and the API's
+   ownership-scoped 404 (never `403`, per §1) would turn that into a
+   confusing dead end instead of the clean empty state a fresh login should
+   show.
+5. **Client-side password-length check on signup** (8 chars, matching
+   `app/core/auth/manager.py`'s `_MIN_PASSWORD_LENGTH`) — a duplicated
+   constant, not a shared import (frontend/backend are separate processes
+   over HTTP, ARCHITECTURE.md forbids the import anyway). Only saves a round
+   trip; the backend's own check is still what actually enforces it.
+
+### Verified
+
+Ran the app directly with `streamlit run app.py` against the real dev
+backend/Postgres (not `docker compose up`, to avoid rebuilding the shared
+container image mid-session) and drove it through `claude-in-chrome`: signed
+up a new account, landed logged-in with an empty conversation list, created
+a conversation, sent a message and watched it stream token-by-token (proves
+the JWT actually reaches the SSE call, not just the CRUD ones), logged out,
+logged back in with the same credentials, confirmed the conversation was
+still there. Tried a wrong password (error shown, no crash) and a duplicate
+signup email (409 surfaced as `st.error`, no crash). `ruff check`/`ruff
+format` clean on both frontend files; no automated frontend test suite
+exists yet (ROADMAP.md's pre-existing gap — `AppTest` doesn't chase
+`st.rerun()` the way a real browser does, per the prior frontend-wiring
+session's own finding), so this was real-browser verification only, same as
+that session's approach.
+
+### Understand before the next step
+
+- **`st.session_state.access_token` is server-memory, tied to one browser
+  tab's WebSocket connection to this specific Streamlit process.** Closing
+  the tab, or restarting the process (e.g. a container redeploy), logs
+  everyone out — there is no persistent cookie or refresh-token flow. Fine
+  for a disposable MVP client; would need real solving before Next.js
+  replaces this (CLAUDE.md's stated plan) if a "stay logged in" experience
+  matters there.
+- **One Streamlit process still means one shared Python process per
+  deployment**, even though tokens are now per-tab/per-account —
+  `st.session_state` is already isolated per session by Streamlit itself,
+  so this was more "the code was wrong" than "the framework can't do this."
+
+### Deliberately deferred
+
+- **Password reset / email verification UI** — no such flow exists on the
+  backend yet either (see the previous session's ADR-0003 note), so there's
+  nothing for the frontend to call.
+- **Social login buttons** — same as the backend: explicitly out of scope,
+  no UI to build until a backend OAuth flow exists.
+- **"Remember me" / persistent login across a page reload or new tab** —
+  see the session-state gotcha above; not attempted.

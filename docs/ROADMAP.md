@@ -185,26 +185,28 @@ next slice and unblocks the frontend's conversation list early.
 - [x] `POST /api/v1/auth/register`, `/login`, `/logout` — done 2026-07-21, composes
       fastapi-users' own routers rather than hand-written thin handlers (ADR-0003).
 - [ ] Rate-limit headers + `X-Params-Dropped` / `X-Request-Id` wiring (§6)
-- [ ] **Newly discovered:** frontend (`frontend/streamlit_app/`) still has no login UI
-      or per-session token storage — `api_client.py` keeps using a static
-      `AGENTOS_API_TOKEN` env var, which must now hold a real JWT (obtained manually)
-      instead of an arbitrary string. Deliberately out of scope for the backend auth
-      slice; see BUILD_LOG.
+- [x] **Frontend login/signup UI** — done 2026-07-21, see BUILD_LOG. Was flagged here as
+      a gap right after the backend auth slice landed; closed the same day.
 - [ ] **Newly discovered:** no self-service way to raise a user's `token_limit` — an
       operator has to update the `users` row directly (no admin endpoint exists).
 
 ### Frontend (Streamlit MVP)
 - [x] `api_client.py` — the only file allowed to talk HTTP to the backend. Sync `httpx`
       (Streamlit's execution model is sync — no asyncio needed). Config via
-      `AGENTOS_API_BASE_URL`/`AGENTOS_API_TOKEN` env vars, not a `config.py` module — that
-      rule is `backend/app/`-scoped (`check_layering.sh` only greps that path).
+      `AGENTOS_API_BASE_URL` env var, not a `config.py` module — that rule is
+      `backend/app/`-scoped (`check_layering.sh` only greps that path). Every function
+      except `register()`/`login()` takes an explicit `token: str` now (real per-account
+      JWTs, done 2026-07-21) — the old shared `AGENTOS_API_TOKEN` env var / module-level
+      `_AUTH_HEADERS` constant are gone; see BUILD_LOG and ADR-0003.
       `create_conversation()` hardcodes `default_model="anthropic:claude-sonnet-4-5"` —
       `GET /api/v1/models` doesn't exist yet, and it's the only model with a real adapter
       anyway. Chat sends go through SSE only, not the non-streaming JSON variant.
-- [x] `app.py` — sidebar conversation list (with delete) + "New conversation", chat
-      history via `list_messages`, `st.chat_input` → `st.write_stream` fed by parsed SSE
-      events, client-side-only title placeholder (`title: null` → "New conversation",
-      never persisted or invented server-side, per §5.2/§7). No pagination UI, no
+- [x] `app.py` — login/signup screen (tabs, done 2026-07-21) gating everything below it
+      until `st.session_state.access_token` is set; sidebar conversation list (with
+      delete) + "New conversation" + logout, chat history via `list_messages`,
+      `st.chat_input` → `st.write_stream` fed by parsed SSE events, client-side-only
+      title placeholder (`title: null` → "New conversation", never persisted or invented
+      server-side, per §5.2/§7). No pagination UI, no
       image/tool_result rendering — neither `files.py` nor `tools.py` exist yet to
       produce those blocks. `st.rerun()` after a send is conditional on success only —
       calling it unconditionally silently discarded the just-rendered `st.error()` before
