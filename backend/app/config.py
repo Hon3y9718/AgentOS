@@ -50,6 +50,14 @@ class Settings(BaseSettings):
         default=None, validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY")
     )
 
+    # WHY a flag, not always-on: app/core/llm/registry.py's live model
+    # refresh makes real HTTP calls to every configured provider. Without
+    # this, `make test` would fire those calls (possibly billed) whenever a
+    # developer's real .env happens to be loaded — tests/conftest.py forces
+    # this to False before importing app.main, independent of what's in any
+    # given developer's .env.
+    enable_live_model_refresh: bool = True
+
 
 # WHY module-level (not a lazy factory): importing this module is the startup
 # path. If required config is missing, this raises immediately on `import

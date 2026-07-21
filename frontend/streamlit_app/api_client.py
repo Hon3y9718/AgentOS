@@ -27,12 +27,13 @@ import httpx
 # one for a client getting replaced by Next.js.
 API_BASE_URL = os.getenv("AGENTOS_API_BASE_URL", "http://localhost:8000")
 API_TOKEN = os.getenv("AGENTOS_API_TOKEN", "dev-token")
-# WHY hardcoded, not fetched from GET /api/v1/models: that endpoint doesn't
-# exist yet (ROADMAP.md) — this is the one model core/llm's registry.yaml
-# actually has an adapter for. A conversation created with no default_model
-# fails its first message with invalid_request ("no model specified"), so
-# the UI needs to set one; there's nothing to select from yet regardless.
-_DEFAULT_MODEL = "anthropic:claude-sonnet-4-5"
+# WHY still a hardcoded fallback, even though GET /api/v1/models exists now:
+# app.py's model selector needs *some* pre-selected value before its first
+# call to that endpoint returns — this is only the initial choice, not a
+# ceiling on what's selectable. A conversation created with no
+# default_model fails its first message with invalid_request ("no model
+# specified"), so the UI must always send one.
+DEFAULT_MODEL = "anthropic:claude-sonnet-4-5"
 
 _AUTH_HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 _DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
@@ -57,6 +58,17 @@ def _raise_for_error(response: httpx.Response) -> None:
         raise ApiError(response.status_code, response.json())
 
 
+def list_models() -> dict[str, Any]:
+    """GET /api/v1/models (§4) — every registered model, with `available`
+    reflecting whether that provider's API key is configured server-side."""
+    with httpx.Client(
+        base_url=API_BASE_URL, headers=_AUTH_HEADERS, timeout=_DEFAULT_TIMEOUT
+    ) as client:
+        response = client.get("/api/v1/models")
+    _raise_for_error(response)
+    return response.json()
+
+
 def list_conversations(*, cursor: str | None = None, limit: int = 20) -> dict[str, Any]:
     """GET /api/v1/conversations (§5.2), newest first."""
     params: dict[str, Any] = {"limit": limit}
@@ -70,14 +82,16 @@ def list_conversations(*, cursor: str | None = None, limit: int = 20) -> dict[st
     return response.json()
 
 
-def create_conversation(*, title: str | None = None) -> dict[str, Any]:
+def create_conversation(
+    *, title: str | None = None, default_model: str = DEFAULT_MODEL
+) -> dict[str, Any]:
     """POST /api/v1/conversations (§5.2). `title` stays null until the
     first exchange completes server-side — see §5.2's client obligation."""
     with httpx.Client(
         base_url=API_BASE_URL, headers=_AUTH_HEADERS, timeout=_DEFAULT_TIMEOUT
     ) as client:
         response = client.post(
-            "/api/v1/conversations", json={"title": title, "default_model": _DEFAULT_MODEL}
+            "/api/v1/conversations", json={"title": title, "default_model": default_model}
         )
     _raise_for_error(response)
     return response.json()
@@ -105,7 +119,7 @@ def list_messages(conversation_id: str, *, cursor: str | None = None) -> dict[st
     return response.json()
 
 
-def stream_chat_message(conversation_id: str, text: str) -> Iterator[dict[str, Any]]:
+def stream_chat_message(conversation_id: str, text: str, *, model: str) -> Iterator[dict[str, Any]]:
     """Send one user turn and yield parsed SSE events (§5.4, §5.5).
 
     WHY yielding the raw parsed {event, data} pairs, not just extracted text
@@ -117,9 +131,16 @@ def stream_chat_message(conversation_id: str, text: str) -> Iterator[dict[str, A
     "send Idempotency-Key on every message creation and reuse it on retry" —
     each call to this function is one send action, not a retry of a
     previous one, so a new key is correct here specifically.
+
+    WHY `model` is a required per-call param, not read from the
+    conversation's own default_model (2026-07-21 update): the model picker
+    is now per-turn, not per-conversation — each send can use a different
+    model, via this same `ChatRequest.model` override field §5.4 already
+    documents. The conversation's default_model is now just its initial
+    seed at creation time, never mutated after.
     """
     idempotency_key = str(uuid.uuid4())
-    payload = {"content": [{"type": "text", "text": text}]}
+    payload = {"content": [{"type": "text", "text": text}], "model": model}
     headers = {
         **_AUTH_HEADERS,
         "Idempotency-Key": idempotency_key,

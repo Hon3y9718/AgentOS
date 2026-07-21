@@ -1,10 +1,9 @@
 # schemas/
 
 Wire format in and out (ARCHITECTURE.md). `conversation.py`, `message.py`,
-`content_block.py`, `pagination.py`, and `chat.py` (§5.4) are real. No
-schema for the model registry entry or the error envelope yet — those are
-still hand-assembled where they're used (`app/core/llm/registry.py`,
-`app/main.py`'s `domain_error_handler`).
+`content_block.py`, `pagination.py`, `chat.py` (§5.4), and `model.py` (§4)
+are real. No schema for the error envelope yet — it's still hand-assembled
+where it's used (`app/main.py`'s `domain_error_handler`).
 
 ## What lives here
 

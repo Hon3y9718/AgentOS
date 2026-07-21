@@ -2,11 +2,12 @@
 
 Orchestration, transactions, decisions (ARCHITECTURE.md). `conversations.py`
 (CRUD, §5.2), `messages.py` (list + truncate-delete, §5.3), `chat.py` (the
-core turn, §5.4 *and* §5.5 — both non-streaming and streaming), and
-`idempotency.py` (§5.4's Idempotency-Key store) are real; `titling.py`,
-`tools.py`, `files.py` are still empty stubs. `messages.py`'s
-`row_to_schema()` is exported (not `_`-prefixed) specifically so `chat.py`
-can reuse it.
+core turn, §5.4 *and* §5.5 — both non-streaming and streaming),
+`idempotency.py` (§5.4's Idempotency-Key store), and `models.py` (§4 — the
+one module here with no DB session at all, since the registry it filters
+is static and in-memory) are real; `titling.py`, `tools.py`, `files.py`
+don't exist yet. `messages.py`'s `row_to_schema()` is exported (not
+`_`-prefixed) specifically so `chat.py` can reuse it.
 
 `chat.py` exports four entry points, not one — `create_chat_message()` for
 the JSON response; `prepare_stream()` + `emit_stream()`, always called as a

@@ -163,8 +163,9 @@ class LLMUsage(BaseModel):
     (API_CONTRACT §3.3). ARCHITECTURE.md's request lifecycle assigns
     "computed cost" to the service, not the adapter — core/llm/ has no
     business reaching into registry pricing data to price its own output.
-    The service combines this with a resolved RegistryEntry.pricing to build
-    the wire Usage when it persists/returns the message.
+    The service combines this with a resolved ModelEntry.pricing (may be
+    None for a model discovered live but not curated — see registry.py) to
+    build the wire Usage when it persists/returns the message.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -186,3 +187,24 @@ class MessageDelta(BaseModel):
 
 
 LLMEvent = ContentBlockStart | ContentBlockDelta | ContentBlockStop | MessageDelta
+
+
+class ProviderModel(BaseModel):
+    """One row of a provider's own live model list (ProviderAdapter.list_models()).
+
+    WHY no pricing field, unlike app.core.llm.catalog.Pricing: only Together's
+    models endpoint returns pricing at all, and it comes back as a float —
+    CLAUDE.md hard-rules money as a decimal string, never a float, everywhere
+    it's used for real billing. Rather than have one adapter smuggle
+    provider-reported float pricing into a type that looks authoritative,
+    pricing here is omitted entirely: it comes ONLY from the curated catalog
+    (app.core.llm.catalog), never from a live response. See registry.py's
+    ModelEntry.from_live().
+    WHY context_window is optional: OpenAI's and Anthropic's models endpoints
+    don't return it at all; Groq's and Together's do.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    context_window: int | None = None

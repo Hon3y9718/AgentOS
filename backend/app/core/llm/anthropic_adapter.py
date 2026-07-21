@@ -42,6 +42,7 @@ from app.core.llm.types import (
     LLMRequest,
     LLMUsage,
     MessageDelta,
+    ProviderModel,
     ReasoningBlockStart,
     ReasoningDelta,
     TextBlockStart,
@@ -71,6 +72,12 @@ _ANTHROPIC_VERSION = "2023-06-01"
 # whichever layer already has to watch every adapter's stream uniformly (the
 # future chat service), not duplicated per adapter.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+_MODELS_URL = "https://api.anthropic.com/v1/models"
+# WHY a separate, short timeout from the streaming call's 120s read: a
+# models-list GET is a single small request with no reason to ever take
+# that long, and registry.py's refresh_if_stale() runs every provider
+# concurrently — one slow provider must not make every refresh wait 120s.
+_MODELS_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
 
 _STOP_REASON_MAP: dict[str, StopReason] = {
     "end_turn": "end_turn",
@@ -173,6 +180,32 @@ class AnthropicAdapter:
                 # §7's client-obligation "ignore unknown event names" applies
                 # just as much to this adapter reading Anthropic's stream as
                 # it does to a client reading ours.
+
+    async def list_models(self) -> list[ProviderModel]:
+        # GOTCHA: verified live during implementation — GET /v1/models
+        # returns {"data": [{"id", "type", "display_name", "created_at"}],
+        # "has_more", "first_id", "last_id"}, cursor-paginated via
+        # ?after_id=<last_id>. Unlike OpenAI/Groq/Together's flat list, this
+        # needs a page loop. No capabilities or pricing in the response —
+        # ProviderModel carries only `id` (and `context_window`, which
+        # Anthropic's models endpoint also doesn't return).
+        headers = {"x-api-key": self._api_key, "anthropic-version": _ANTHROPIC_VERSION}
+        models: list[ProviderModel] = []
+        after_id: str | None = None
+        async with httpx.AsyncClient(timeout=_MODELS_TIMEOUT) as client:
+            while True:
+                params: dict[str, Any] = {"limit": 1000}
+                if after_id is not None:
+                    params["after_id"] = after_id
+                response = await client.get(_MODELS_URL, headers=headers, params=params)
+                if response.status_code >= 400:
+                    _raise_for_error_response(response)
+                body = response.json()
+                models.extend(ProviderModel(id=m["id"]) for m in body.get("data", []))
+                if not body.get("has_more"):
+                    break
+                after_id = body.get("last_id")
+        return models
 
 
 def _iter_sse_data(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:

@@ -31,7 +31,7 @@ those three, not here.
 | 3. Conversations CRUD (service + router) | ✅ done |
 | 4. Provider abstraction (`core/llm`, registry, first adapter) | ✅ done |
 | 5. Chat endpoint (the core streamed turn) | ✅ done |
-| 6. Remaining providers, tools, files, titling | 🟡 in progress — openai/groq/together adapters wired; gemini + tools/files/titling remain |
+| 6. Remaining providers, tools, files, titling | 🟡 in progress — 4 adapters + live model discovery + per-turn picker done; gemini adapter, tools, files, titling, cancellation remain |
 | 7. Frontend (Streamlit MVP) | ✅ done |
 | 8. Test coverage (contract fixtures, live smoke) | ⬜ not started |
 
@@ -81,15 +81,16 @@ next slice and unblocks the frontend's conversation list early.
 - [x] `/health/ready` should also check registry load per §5.1 — done, though ADR-0002
       decision 5 notes it's closer to documentation than a live failure detector, since
       the registry loads (and would crash the process) at import time.
-- [ ] **Newly discovered:** `test_chat.py::test_chat_bumps_message_count_and_updated_at`
-      compares a conversation row's `updated_at` set by Postgres's `func.now()` (on
-      creation) against a value `chat.py`'s `_bump_conversation()` sets from Python's own
-      `datetime.now(UTC)` (on the bump) — two different clocks. Passed in this session's
-      own verification run once Postgres was healthy, but is one VM clock-drift event away
-      from failing (observed once, immediately after a fresh `colima start`, whose own
-      boot log reported a `-323ms` guest-clock adjustment — see BUILD_LOG). Not fixed here
-      — unrelated to the adapter-wiring task this session did, and the real fix (use one
-      clock, not two) touches `chat.py`'s bump logic, not `core/llm`.
+- [x] `test_chat.py::test_chat_bumps_message_count_and_updated_at` clock-mixing bug —
+      Fixed 2026-07-21, see BUILD_LOG. Was comparing a conversation row's `updated_at`
+      set by Postgres's `func.now()` (on creation) against a value `chat.py`'s
+      `_bump_conversation()` set from Python's own `datetime.now(UTC)` (on the bump) —
+      two different clocks. Reproduced on 3/3 real `make test` runs across two sessions
+      (not the one-off VM-clock-drift event first suspected). Fix: stopped
+      `_bump_conversation()` from setting `updated_at` at all — the column already
+      declares `onupdate=func.now()` (app/models/conversation.py), so any ORM-issued
+      UPDATE already sets it from Postgres's own clock; the removed line was overriding
+      that with a second, different clock.
 - [ ] **Newly discovered:** `main.py` has no exception handler for FastAPI's own
       `RequestValidationError` — only for our `DomainError`. Every 422 caused by FastAPI's
       *own* request validation (a missing required header, an `extra="forbid"` violation,
@@ -100,35 +101,60 @@ next slice and unblocks the frontend's conversation list early.
       `main.py`, registered for `RequestValidationError`, mapping to `validation_error`.
 
 ### `core/llm`
-- [x] `registry.yaml` + startup loader/validator (§4) — one model (Anthropic's
-      claude-sonnet-4-5) for now; add a provider's models only alongside its adapter.
+- [x] `catalog.yaml` + `catalog.py` loader/validator (§4) — Done 2026-07-21, see
+      BUILD_LOG. Renamed from `registry.yaml`/most of old `registry.py` — this is now
+      the curated *enrichment* table (capabilities/pricing/display data for models
+      verified by hand), not the full list of models the API can serve. Still
+      crash-loud at import on a malformed row.
+- [x] `registry.py` — live model registry (§4). Rewritten 2026-07-21 for live
+      discovery: merges `catalog.py`'s curated data with each configured provider's
+      own live model list (`ModelRegistry.refresh_if_stale()` — TTL-cached 5min,
+      single-flighted, best-effort per provider, never fatal). `resolve()`/
+      `is_available()` stay synchronous and network-free (read only the in-memory
+      cache) since `chat.py` calls them on every message — see BUILD_LOG for the bug
+      this avoided (a live-fetch-gated model would 404 before the first successful
+      refresh, if not seeded from the catalog synchronously at construction).
 - [x] Normalized request/event types (`types.py`) — reuses `app.schemas.content_block`
       and `StopReason`; does NOT reuse `Usage` (needs registry pricing the service, not
-      the adapter, should own — see `LLMUsage`, ADR-0002).
+      the adapter, should own — see `LLMUsage`, ADR-0002). `ProviderModel` added
+      2026-07-21 for `list_models()` — deliberately no pricing field (only Together
+      returns one, as an untrusted float).
 - [x] Adapter: anthropic — `stream()` only, no separate non-streaming path (ADR-0002
       decision 3). `reasoning_effort`/`response_format` request params are silently
       dropped (no `X-Params-Dropped` channel exists yet); `file_id` image blocks raise
-      (no Files API yet).
-- [x] Adapter: openai — wired into `chat.py`'s `_ADAPTER_CLASSES` this session (see
-      BUILD_LOG); the adapter module and its test existed already, only the dispatch +
-      registry.yaml entry (`openai:gpt-4o`) were missing.
-- [x] Adapter: groq — same as openai above (`groq:llama-3.3-70b-versatile`).
-- [x] Adapter: together — same, plus this session wrote `test_together_adapter.py`
-      (`together:meta-llama/Llama-3.3-70B-Instruct-Turbo`), which didn't exist yet unlike
-      openai/groq's test files — see BUILD_LOG for why that test isn't live-verified the
-      way the other three adapters' tests are.
-- [ ] Adapter: gemini
+      (no Files API yet). `list_models()` added 2026-07-21 — the one adapter needing a
+      pagination loop (`has_more`/`after_id`), live-verified (10 real models).
+- [x] Adapter: openai — wired into `chat.py`'s dispatch in an earlier session;
+      `list_models()` added 2026-07-21, live-verified (125 real entries). **Known rough
+      edge, not fixed:** OpenAI's `/v1/models` returns every model type the account can
+      see, not just chat-capable ones — whisper/tts/embedding models show up in the
+      frontend's picker alongside gpt-4o, since nothing in the response distinguishes
+      them and this repo has no per-model capability data for anything outside the
+      curated catalog. Picking one and sending a message fails with a real (if
+      confusing) upstream error rather than crashing — not silently wrong, just not
+      filtered.
+- [x] Adapter: groq — `list_models()` added 2026-07-21, live-verified (15 real
+      entries) — unlike OpenAI's, Groq's response DOES include `context_window` per
+      model, passed through.
+- [x] Adapter: together — `list_models()` added 2026-07-21, live-verified (273 real
+      entries) — its `/v1/models` returns a bare JSON array, unlike every other
+      provider's `{"data": [...]}` wrapper.
+- [ ] Adapter: gemini — still no adapter, so no `list_models()` for it either; same
+      "additive once one adapter proves the abstraction" reasoning as before.
 - [ ] Capability enforcement before a provider call (§4) — `chat.py` exists now but
       doesn't do this yet; the registry has the `capabilities` data, nothing calls it.
+      Now also has to account for `capabilities` being possibly `None` (a live-only
+      model), not just present-or-missing.
 - [ ] `X-Params-Dropped` reporting channel — `chat.py` silently drops `reasoning_effort`/
       `response_format` (Anthropic has no equivalent this adapter implements) rather than
       setting this header, since there's still no plumbing from service to router for
       "here's what I dropped." Needed before this is contract-complete.
 - [x] `pricing.py` — `compute_cost_usd()`, pure Decimal arithmetic over `LLMUsage` +
-      registry `Pricing`. Gotcha: `Pricing` has no cache-*write* rate (only cache-read) —
+      catalog `Pricing`. Gotcha: `Pricing` has no cache-*write* rate (only cache-read) —
       cache writes are billed at the plain input rate, an underestimate. Low-impact today
       (nothing requests prompt caching yet, so cache_write_tokens is always 0 in
-      practice) but flagged for whoever adds prompt caching support.
+      practice) but flagged for whoever adds prompt caching support. Callers must guard
+      `pricing is not None` themselves now (2026-07-21) — a live-only model has none.
 
 ### `app/services`
 - [x] `conversations.py` — CRUD + soft delete
@@ -158,8 +184,11 @@ next slice and unblocks the frontend's conversation list early.
 - [ ] `files.py` — multipart upload, size-limit enforcement
 - [ ] Cancellation flag (DB-polled for MVP, per ARCHITECTURE "State and concurrency")
 
-### `app/api/v1` — `conversations.py` and `deps.py` real, rest still empty stubs
-- [ ] `GET /api/v1/models`
+### `app/api/v1` — `conversations.py`, `deps.py`, `models.py` real; `tools.py`/`files.py` don't exist yet
+- [x] `GET /api/v1/models` — Done 2026-07-21, see BUILD_LOG. `app/schemas/model.py` +
+      `app/services/models.py` are new; no DB session (registry is static/in-memory).
+      Query filters (`provider`, `capability` repeated/ANDed, `available`) match §4
+      exactly. Now consumed by the frontend's model selector — see Frontend below.
 - [ ] `GET /api/v1/providers/health`
 - [x] `POST /api/v1/conversations`, `GET` (list), `GET /{id}`, `PATCH /{id}`,
       `DELETE /{id}`
@@ -184,9 +213,36 @@ next slice and unblocks the frontend's conversation list early.
       (Streamlit's execution model is sync — no asyncio needed). Config via
       `AGENTOS_API_BASE_URL`/`AGENTOS_API_TOKEN` env vars, not a `config.py` module — that
       rule is `backend/app/`-scoped (`check_layering.sh` only greps that path).
-      `create_conversation()` hardcodes `default_model="anthropic:claude-sonnet-4-5"` —
-      `GET /api/v1/models` doesn't exist yet, and it's the only model with a real adapter
-      anyway. Chat sends go through SSE only, not the non-streaming JSON variant.
+      `create_conversation(default_model=...)` takes the model as a parameter instead
+      of hardcoding it — `DEFAULT_MODEL` is only the initial pre-selection before
+      Settings' first `list_models()` call returns. `stream_chat_message(..., model=...)`
+      sends the model as a required per-turn override (`ChatRequest.model`, §5.4) —
+      nothing PATCHes a conversation's `default_model` anymore; the choice is per-turn,
+      not per-conversation.
+- [x] Settings page + provider/model selection — Done 2026-07-21, see BUILD_LOG.
+      `st.navigation`/`st.Page` (Streamlit 1.36+) splits the app into "Chat" and
+      "Settings"; provider (default **groq**, per explicit instruction) and model are
+      both chosen only on Settings, as two dependent selectboxes (model options filter
+      to the chosen provider, resetting to a sensible default when the provider
+      changes). Chat itself stays a plain, bottom-pinned `st.chat_input` with no picker
+      at all — a deliberate simplification after finding that `st.chat_input` only
+      auto-pins to the viewport bottom when it isn't nested inside a layout container
+      like `st.columns`, so an earlier "picker beside the input" design would have
+      made the whole composer scroll out of view on a long conversation; asked the
+      user how to resolve that tradeoff and they chose "settings only, keep chat
+      focused" over either alternative. `st.session_state.selected_model` is still
+      session-global (ChatGPT/Claude-style — doesn't resync when switching
+      conversations). Each assistant message keeps its small model-name caption
+      (`Message.model`, informational only, not a control). Hit and fixed a real
+      Streamlit bug along the way: a selectbox using `key="selected_provider"` where
+      that same key was *also* written by plain assignment elsewhere silently ignored
+      a pre-set session_state value and defaulted to index 0 — fixed by giving every
+      such widget its own private key (`_provider_widget`/`_model_widget`) with an
+      explicit `index=` and a manual sync back to the real semantic session_state
+      variable. Verified live: switching provider on Settings correctly repopulates
+      the model list and picks a sensible default; a real send after switching to
+      Anthropic surfaced a genuine "credit balance too low" error from Anthropic's own
+      API (an account/billing issue, not a bug) — still confirms real routing.
 - [x] `app.py` — sidebar conversation list (with delete) + "New conversation", chat
       history via `list_messages`, `st.chat_input` → `st.write_stream` fed by parsed SSE
       events, client-side-only title placeholder (`title: null` → "New conversation",
@@ -250,5 +306,5 @@ next slice and unblocks the frontend's conversation list early.
 
 ---
 
-*Last updated: 2026-07-21, after wiring the openai/groq/together adapters into `chat.py`'s
-dispatch table.*
+*Last updated: 2026-07-21, after live model discovery (catalog + per-provider live
+fetch) and adding a Settings page for provider/model selection, keeping Chat plain.*

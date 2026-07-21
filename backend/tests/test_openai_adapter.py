@@ -13,7 +13,12 @@ import httpx
 import pytest
 import respx
 
-from app.core.errors import ContextLengthExceededError, ProviderUnavailableError, RateLimitedError
+from app.core.errors import (
+    ContextLengthExceededError,
+    InternalError,
+    ProviderUnavailableError,
+    RateLimitedError,
+)
 from app.core.llm.openai_adapter import OpenAIAdapter
 from app.core.llm.types import (
     ContentBlockDelta,
@@ -32,6 +37,7 @@ from app.core.llm.types import (
 from app.schemas.content_block import TextBlock
 
 _URL = "https://api.openai.com/v1/chat/completions"
+_MODELS_URL = "https://api.openai.com/v1/models"
 
 
 def _sse(chunks: list[dict[str, object]]) -> bytes:
@@ -262,3 +268,51 @@ async def test_stream_defaults_to_error_stop_reason_when_finish_reason_missing()
     terminal = events[-1]
     assert isinstance(terminal, MessageDelta)
     assert terminal.stop_reason == "error"
+
+
+@respx.mock
+async def test_list_models_translates_flat_list() -> None:
+    # WHY a flat list, no pagination: verified live during implementation —
+    # unlike Anthropic, GET /v1/models returns everything in one response
+    # (125 real entries as of this check, including non-chat models like
+    # whisper/tts/embeddings — this adapter doesn't filter those out, since
+    # OpenAI's own response carries no field distinguishing them).
+    respx.get(_MODELS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"id": "gpt-4o", "object": "model", "owned_by": "openai"},
+                    {"id": "gpt-4o-mini", "object": "model", "owned_by": "openai"},
+                ],
+            },
+        )
+    )
+
+    adapter = OpenAIAdapter(api_key="sk-test")
+    models = await adapter.list_models()
+
+    assert [m.id for m in models] == ["gpt-4o", "gpt-4o-mini"]
+    assert models[0].context_window is None
+
+
+@respx.mock
+async def test_list_models_maps_error() -> None:
+    respx.get(_MODELS_URL).mock(
+        return_value=httpx.Response(
+            401,
+            json={
+                "error": {
+                    "type": "authentication_error",
+                    "message": "bad key",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+    )
+
+    adapter = OpenAIAdapter(api_key="sk-bad")
+    with pytest.raises(InternalError) as exc_info:
+        await adapter.list_models()
+    assert exc_info.value.details["provider"] == "openai"

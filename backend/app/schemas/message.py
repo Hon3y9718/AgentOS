@@ -28,9 +28,13 @@ class Usage(BaseModel):
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
-    # WHY str, not float: API_CONTRACT.md — "cost_usd is a decimal string,
-    # not a float. Money never rides a float."
-    cost_usd: str
+    # WHY str, not float, when present: API_CONTRACT.md — "cost_usd is a
+    # decimal string, not a float. Money never rides a float." WHY nullable
+    # (2026-07-21 update, see API_CONTRACT.md §3.3): a message sent on a
+    # model discovered live but not in the curated catalog has no known
+    # pricing to compute this from — null means "unpriced," never a
+    # fabricated or approximated value.
+    cost_usd: str | None
 
 
 class Message(BaseModel):

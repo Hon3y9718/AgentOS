@@ -17,8 +17,8 @@ dependencies = [
     # simpler to reason about than five SDKs with different conventions.
     "httpx>=0.27",
     # WHY pyyaml explicit, not left implicit: it was already resolved
-    # transitively (uvicorn[standard] pulls it in), but core/llm/registry.py
-    # imports it directly to parse registry.yaml (API_CONTRACT.md §4) — an
+    # transitively (uvicorn[standard] pulls it in), but core/llm/catalog.py
+    # imports it directly to parse catalog.yaml (API_CONTRACT.md §4) — an
     # explicit dependency shouldn't rely on another package's extras still
     # including it.
     "pyyaml>=6.0",

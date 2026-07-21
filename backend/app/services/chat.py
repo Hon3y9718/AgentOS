@@ -37,13 +37,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.core.errors import DomainError, InvalidRequestError, ProviderUnavailableError
 from app.core.ids import new_id
-from app.core.llm.adapter import ProviderAdapter
-from app.core.llm.anthropic_adapter import AnthropicAdapter
-from app.core.llm.groq_adapter import GroqAdapter
-from app.core.llm.openai_adapter import OpenAIAdapter
+from app.core.llm.adapter import ADAPTER_CLASSES, ProviderAdapter
 from app.core.llm.pricing import compute_cost_usd
-from app.core.llm.registry import RegistryEntry, registry
-from app.core.llm.together_adapter import TogetherAdapter
+from app.core.llm.registry import ModelEntry, registry
 from app.core.llm.types import (
     ContentBlockDelta,
     ContentBlockStart,
@@ -142,7 +138,7 @@ class _FreshPlan(NamedTuple):
     """`prepare_stream()`'s result when this is a genuinely new turn."""
 
     idempotency_key: str
-    entry: RegistryEntry
+    entry: ModelEntry
     llm_request: LLMRequest
     user_row: MessageModel
     assistant_row: MessageModel
@@ -426,7 +422,7 @@ def _replay_block_frames(index: int, block: ContentBlock) -> tuple[str, str]:
 
 async def _run_turn(
     db: AsyncSession,
-    entry: RegistryEntry,
+    entry: ModelEntry,
     llm_request: LLMRequest,
     user_row: MessageModel,
     assistant_row: MessageModel,
@@ -472,14 +468,19 @@ async def _run_turn(
     )
 
 
-def _usage_dict(usage: LLMUsage, entry: RegistryEntry) -> dict[str, Any]:
+def _usage_dict(usage: LLMUsage, entry: ModelEntry) -> dict[str, Any]:
     return {
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "cache_read_tokens": usage.cache_read_tokens,
         "cache_write_tokens": usage.cache_write_tokens,
         "reasoning_tokens": usage.reasoning_tokens,
-        "cost_usd": compute_cost_usd(usage, entry.pricing),
+        # WHY None when entry.pricing is None (2026-07-21 update): a model
+        # discovered live but absent from the curated catalog has no known
+        # per-token price — null means "unpriced," never a fabricated cost.
+        # See docs/API_CONTRACT.md §3.3 and core/llm/registry.py's
+        # ModelEntry.
+        "cost_usd": compute_cost_usd(usage, entry.pricing) if entry.pricing is not None else None,
     }
 
 
@@ -547,28 +548,12 @@ class _ContentAccumulator:
         return [self._blocks[i] for i in self._order]
 
 
-# WHY a factory dict, not a chain of `if`s: one entry per adapter that
-# exists, added alongside that adapter (same rule registry.yaml's own
-# header states). gemini has no adapter yet, so it has no entry here either
-# — `.get()` below falls through to the same "not implemented" error a
-# gemini registry.yaml entry would otherwise silently bypass.
-# WHY `Callable[[str], ProviderAdapter]`, not `type[ProviderAdapter]`: the
-# `ProviderAdapter` Protocol (adapter.py) deliberately declares only
-# `stream()` — construction isn't part of that interface. Every adapter
-# class here happens to share the same `__init__(api_key: str)` shape, but
-# that's a fact about these four classes, not a contract `adapter.py`
-# promises; typing the dict as a one-arg factory says exactly that, without
-# mypy needing (incorrectly) to treat `__init__` as part of the Protocol.
-_ADAPTER_CLASSES: dict[str, Callable[[str], ProviderAdapter]] = {
-    "anthropic": AnthropicAdapter,
-    "openai": OpenAIAdapter,
-    "groq": GroqAdapter,
-    "together": TogetherAdapter,
-}
-
-
-def _get_adapter(entry: RegistryEntry) -> ProviderAdapter:
-    factory = _ADAPTER_CLASSES.get(entry.provider)
+def _get_adapter(entry: ModelEntry) -> ProviderAdapter:
+    # WHY ADAPTER_CLASSES lives in core.llm.adapter, not defined here: it's
+    # also needed by core.llm.registry.py's live refresh — see that
+    # module's own WHY comment for why one shared dict beats two that can
+    # drift out of sync.
+    factory = ADAPTER_CLASSES.get(entry.provider)
     if factory is None:
         raise InvalidRequestError(
             f"No adapter implemented for provider {entry.provider!r} yet.",
@@ -586,7 +571,7 @@ def _get_adapter(entry: RegistryEntry) -> ProviderAdapter:
 
 async def _validate_and_resolve(
     db: AsyncSession, user_id: str, conversation_id: str, data: ChatRequest
-) -> tuple[Conversation, RegistryEntry, LLMParams]:
+) -> tuple[Conversation, ModelEntry, LLMParams]:
     """Everything that can reject a request before any persistence or
     idempotency claim happens. Shared by both response shapes.
 
@@ -623,7 +608,7 @@ async def _validate_and_resolve(
 async def _persist_turn_start(
     db: AsyncSession,
     conversation: Conversation,
-    entry: RegistryEntry,
+    entry: ModelEntry,
     params: LLMParams,
     data: ChatRequest,
 ) -> tuple[LLMRequest, MessageModel, MessageModel]:
@@ -723,16 +708,27 @@ async def _load_history(db: AsyncSession, conversation_id: str) -> list[LLMMessa
 
 
 async def _bump_conversation(db: AsyncSession, conversation_id: str) -> None:
-    """Increment message_count and touch updated_at for a newly-inserted row.
+    """Increment message_count for a newly-inserted row; `updated_at` follows.
 
     WHY this doesn't commit: called once per new message row from within
     `_persist_turn_start`, which commits the message insert and this bump
     together in one transaction. Not called again when a row is later
     updated in place (e.g. assistant pending -> complete) — message_count
     counts rows created, not status transitions.
+
+    WHY no explicit `row.updated_at = ...` here (there used to be one): the
+    column already declares `onupdate=func.now()`
+    (app/models/conversation.py) — any UPDATE the ORM emits for this row
+    already sets `updated_at` from Postgres's own clock. The removed line
+    overrode that with `datetime.now(UTC)`, the *app* server's clock, which
+    a test comparing this row's `updated_at` before/after against
+    Postgres-clock-set values could observe as going backwards whenever the
+    two clocks disagreed — see docs/BUILD_LOG.md for the session that found
+    this via a reproducing (not flaky) test failure. `conversations.py`'s
+    `update_conversation()` never set this column manually either; this was
+    the one place inconsistent with that.
     """
     row = (
         await db.execute(select(ConversationModel).where(ConversationModel.id == conversation_id))
     ).scalar_one()
     row.message_count += 1
-    row.updated_at = datetime.now(UTC).replace(tzinfo=None)

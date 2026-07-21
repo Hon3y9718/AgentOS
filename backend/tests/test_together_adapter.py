@@ -1,12 +1,12 @@
 """app/core/llm/together_adapter.py (API_CONTRACT.md §5.5, ADR-0002).
 
 Contract tier (ARCHITECTURE.md): fixture-driven, mocked transport, no real
-network. Unlike test_groq_adapter.py/test_openai_adapter.py, this file was
-NOT live-verified against the real Together API — it was written after the
-fact, from the adapter module's own docstring/comments (which do claim live
-verification of the usage-field location and error codes; see BUILD_LOG for
-this session). Fixtures here encode what those comments assert, not a fresh
-live check.
+network. The stream() tests below were NOT live-verified against the real
+Together API — written from the adapter module's own docstring/comments
+(which do claim live verification of the usage-field location and error
+codes; see BUILD_LOG for that session). The list_models() tests below ARE
+live-verified (a later session actually called the real endpoint — 273 real
+models returned, confirming the bare-array response shape).
 """
 
 import json
@@ -15,7 +15,12 @@ import httpx
 import pytest
 import respx
 
-from app.core.errors import InvalidRequestError, ProviderUnavailableError, RateLimitedError
+from app.core.errors import (
+    InternalError,
+    InvalidRequestError,
+    ProviderUnavailableError,
+    RateLimitedError,
+)
 from app.core.llm.together_adapter import TogetherAdapter
 from app.core.llm.types import (
     ContentBlockDelta,
@@ -34,6 +39,7 @@ from app.core.llm.types import (
 from app.schemas.content_block import TextBlock
 
 _URL = "https://api.together.xyz/v1/chat/completions"
+_MODELS_URL = "https://api.together.xyz/v1/models"
 
 
 def _sse(chunks: list[dict[str, object]]) -> bytes:
@@ -228,3 +234,45 @@ async def test_stream_maps_insufficient_quota_to_provider_unavailable() -> None:
     with pytest.raises(ProviderUnavailableError):
         async for _ in adapter.stream(_request()):
             pass
+
+
+@respx.mock
+async def test_list_models_translates_bare_array() -> None:
+    # WHY a bare array, not {"data": [...]}: live-verified this session —
+    # unlike every other adapter's models endpoint, Together's GET
+    # /v1/models returns a plain JSON array at the top level.
+    respx.get(_MODELS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                    "context_length": 131072,
+                    "pricing": {"input": 0.88, "output": 0.88},
+                }
+            ],
+        )
+    )
+
+    adapter = TogetherAdapter(api_key="together-test")
+    models = await adapter.list_models()
+
+    assert models[0].id == "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    # WHY context_length, not context_window, on the input fixture: that's
+    # Together's real field name — the adapter renames it on the way out.
+    assert models[0].context_window == 131072
+
+
+@respx.mock
+async def test_list_models_maps_error() -> None:
+    respx.get(_MODELS_URL).mock(
+        return_value=httpx.Response(
+            401,
+            json={"error": {"type": "authentication_error", "message": "bad key"}},
+        )
+    )
+
+    adapter = TogetherAdapter(api_key="together-bad")
+    with pytest.raises(InternalError) as exc_info:
+        await adapter.list_models()
+    assert exc_info.value.details["provider"] == "together"

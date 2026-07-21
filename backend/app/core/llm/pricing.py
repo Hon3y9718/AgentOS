@@ -8,7 +8,7 @@ holding both has (see ADR-0002's note on why MessageDelta.usage is LLMUsage,
 not the wire Usage type).
 Called by: app/services/chat.py (and the future SSE chat service, once it
 exists — the same math, not duplicated).
-Calls: app.core.llm.types, app.core.llm.registry.
+Calls: app.core.llm.types, app.core.llm.catalog.
 Gotcha: `Pricing` (§4) has no cache-write rate — Anthropic prices cache
 writes at a premium over plain input tokens, but the contract's registry
 shape doesn't model that distinctly. cache_write_tokens is billed at the
@@ -21,7 +21,7 @@ See: docs/DECISIONS/0002 Provider Abstraction.md
 
 from decimal import ROUND_HALF_UP, Decimal
 
-from app.core.llm.registry import Pricing
+from app.core.llm.catalog import Pricing
 from app.core.llm.types import LLMUsage
 
 _MTOK = Decimal(1_000_000)

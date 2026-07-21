@@ -13,7 +13,12 @@ import httpx
 import pytest
 import respx
 
-from app.core.errors import InvalidRequestError, ProviderUnavailableError, RateLimitedError
+from app.core.errors import (
+    InternalError,
+    InvalidRequestError,
+    ProviderUnavailableError,
+    RateLimitedError,
+)
 from app.core.llm.groq_adapter import GroqAdapter
 from app.core.llm.types import (
     ContentBlockDelta,
@@ -32,6 +37,7 @@ from app.core.llm.types import (
 from app.schemas.content_block import TextBlock
 
 _URL = "https://api.groq.com/openai/v1/chat/completions"
+_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
 
 def _sse(chunks: list[dict[str, object]]) -> bytes:
@@ -221,3 +227,49 @@ async def test_stream_maps_insufficient_quota_to_provider_unavailable() -> None:
     with pytest.raises(ProviderUnavailableError):
         async for _ in adapter.stream(_request()):
             pass
+
+
+@respx.mock
+async def test_list_models_includes_context_window() -> None:
+    # WHY context_window is asserted non-None here, unlike
+    # OpenAI/Anthropic's equivalent tests: verified live during
+    # implementation — Groq's /openai/v1/models response DOES report it
+    # per model (15 real entries as of this check), unlike OpenAI's own
+    # endpoint.
+    respx.get(_MODELS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "llama-3.3-70b-versatile",
+                        "object": "model",
+                        "active": True,
+                        "context_window": 131072,
+                    }
+                ],
+            },
+        )
+    )
+
+    adapter = GroqAdapter(api_key="gsk-test")
+    models = await adapter.list_models()
+
+    assert models[0].id == "llama-3.3-70b-versatile"
+    assert models[0].context_window == 131072
+
+
+@respx.mock
+async def test_list_models_maps_error() -> None:
+    respx.get(_MODELS_URL).mock(
+        return_value=httpx.Response(
+            401,
+            json={"error": {"type": "authentication_error", "message": "bad key"}},
+        )
+    )
+
+    adapter = GroqAdapter(api_key="gsk-bad")
+    with pytest.raises(InternalError) as exc_info:
+        await adapter.list_models()
+    assert exc_info.value.details["provider"] == "groq"

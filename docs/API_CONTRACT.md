@@ -204,7 +204,10 @@ the partial content was persisted and is valid conversational history.
 `stop_reason` is normalized across providers: `end_turn` | `max_tokens` | `tool_use` |
 `stop_sequence` | `content_filter` | `error` | `cancelled`.
 
-`cost_usd` is a **decimal string**, not a float. Money never rides a float.
+`cost_usd` is a **decimal string**, not a float, when present. It is `null` when the
+model used has no known pricing — a model discovered live from a provider but absent
+from the curated catalog (§4) has no per-token rate to compute a cost from, and this
+API never fabricates or approximates one.
 
 ---
 
@@ -250,19 +253,42 @@ Query: `?capability=tools`, `?capability=vision`, `?provider=groq`, `?available=
       },
       "available": true,
       "deprecated_at": null
+    },
+    {
+      "id": "openai:some-new-model-not-yet-curated",
+      "provider": "openai",
+      "display_name": "some-new-model-not-yet-curated",
+      "family": "unknown",
+      "context_window": null,
+      "max_output_tokens": null,
+      "capabilities": null,
+      "pricing": null,
+      "available": true,
+      "deprecated_at": null
     }
   ]
 }
 ```
 
-The registry is a **static declarative file** in the repo (`backend/app/core/llm/registry.yaml`),
-loaded and validated at startup. It is not fetched from providers at runtime — a provider
-outage must not change which models your API claims to support. `available` reflects
-whether the required API key is configured plus the last health probe result.
+**Updated 2026-07-21 — live discovery.** The model list is a hybrid, not a purely static
+file. A small curated catalog (`backend/app/core/llm/catalog.yaml`), checked into the
+repo, supplies `capabilities`/`pricing`/`display_name`/`family` for models verified by
+hand — this part is still loaded and validated once, at startup, and still crashes
+loudly on a malformed row (an operator mistake). Separately, each configured provider's
+own live model list is fetched periodically (TTL-cached, best-effort — a provider being
+briefly unreachable degrades that provider's data to "stale," not "gone," and never
+fails the request) and merged in. A model discovered live but absent from the catalog
+still appears and is still usable for chat — see the second example object above —
+with `capabilities`, `pricing`, `context_window`, and `max_output_tokens` all `null`
+rather than fabricated, and any message sent on it persists `usage.cost_usd: null`
+(§3.3) rather than an invented cost. `available` is unchanged: it reflects whether the
+required API key is configured, independent of curation or live-discovery state.
 
-Any request naming a model absent from the registry fails fast with `invalid_request`.
-Capability enforcement happens before the provider call: asking a non-vision model for an
-image request returns `invalid_request`, not a confusing upstream 400.
+Any request naming a model absent from the registry (curated or live-discovered) fails
+fast with `invalid_request`. Capability enforcement happens before the provider call:
+asking a non-vision model for an image request returns `invalid_request`, not a
+confusing upstream 400 — this only applies to models with known (non-null)
+capabilities today; a live-only model's capabilities are unknown, not false.
 
 ---
 
@@ -274,7 +300,10 @@ image request returns `invalid_request`, not a confusing upstream 400.
 is up. Used by the container orchestrator.
 
 `GET /health/ready` — readiness. Checks DB connectivity and registry load. Returns `503`
-with per-check detail if unhealthy. Does **not** call providers.
+with per-check detail if unhealthy. Does **not** call providers — this stays true even
+with §4's live model discovery: readiness only checks that the curated catalog loaded,
+never live-refresh state. `GET /api/v1/models` is where live provider data actually
+gets fetched.
 
 `GET /api/v1/providers/health` — authenticated, deliberately separate and slow. Performs
 a cheap probe per configured provider and reports latency and status. Never used as a
@@ -578,3 +607,4 @@ types without a coordinated frontend release.
 | 2026-07-19 | Initial contract. Conversations, messages, SSE chat, models, tools, files. |
 | 2026-07-20 | §5.3 messages: cursor list (`order` default `asc`, `include_reasoning`) and truncate-delete fully specified. |
 | 2026-07-20 | Fixed `cost_usd` in §3.3's and §5.5's worked examples (`"0.001584"` → `"0.002556"`) — didn't arithmetically match §4's pricing example for the same model and token counts; doc-internal inconsistency, not a formula change. |
+| 2026-07-21 | §4: model registry is now a hybrid of a curated static catalog plus live, per-provider model discovery, not a purely static file — reopens ADR-0002 decision 5 (see its own updated entry). `Model.capabilities`, `Model.pricing`, `Model.context_window`, `Model.max_output_tokens`, and `Usage.cost_usd` (§3.3) are all nullable now — `null` means "unknown/unpriced," for a model discovered live but not yet curated, never a fabricated value. |

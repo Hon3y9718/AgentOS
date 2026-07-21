@@ -341,3 +341,47 @@ def test_chat_bumps_message_count_and_updated_at(
     after = client.get(f"{BASE}/{conversation_id}", headers=auth_headers).json()
     assert after["message_count"] == 2
     assert after["updated_at"] > before["updated_at"]
+
+
+@respx.mock
+def test_chat_persists_null_cost_usd_for_model_with_no_curated_pricing(
+    client: TestClient, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-07-21 live-discovery update: a model resolvable in the registry
+    but absent from catalog.yaml has entry.pricing=None — the turn must
+    still complete and persist usage.cost_usd as null, not raise or
+    fabricate a price. See core/llm/registry.py's ModelEntry and
+    chat.py's _usage_dict()."""
+    from app.core.llm.registry import ModelEntry, registry
+
+    unpriced_id = "anthropic:claude-live-only-test"
+    unpriced_entry = ModelEntry(
+        id=unpriced_id,
+        provider="anthropic",
+        display_name="claude-live-only-test",
+        family="unknown",
+        context_window=None,
+        max_output_tokens=None,
+        capabilities=None,
+        pricing=None,
+    )
+    # WHY setitem on the shared singleton's private _entries, not a fresh
+    # ModelRegistry: chat.py's service functions import `registry` directly
+    # from app.core.llm.registry at module scope — there's no seam to swap
+    # in a different instance for one request without also patching every
+    # one of those import sites. monkeypatch restores this automatically.
+    monkeypatch.setitem(registry._entries, unpriced_id, unpriced_entry)  # type: ignore[attr-defined]
+
+    respx.post(_ANTHROPIC_URL).mock(return_value=httpx.Response(200, content=_text_response_body()))
+    conversation_id = _create_conversation(client, auth_headers, default_model=unpriced_id)
+
+    response = client.post(
+        f"{BASE}/{conversation_id}/messages",
+        json={"content": [{"type": "text", "text": "Hi"}]},
+        headers=_chat_headers(auth_headers),
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["assistant_message"]["status"] == "complete"
+    assert body["assistant_message"]["usage"]["cost_usd"] is None

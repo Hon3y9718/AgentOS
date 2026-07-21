@@ -11,7 +11,7 @@ import httpx
 import pytest
 import respx
 
-from app.core.errors import ProviderUnavailableError, RateLimitedError
+from app.core.errors import InternalError, ProviderUnavailableError, RateLimitedError
 from app.core.llm.anthropic_adapter import AnthropicAdapter
 from app.core.llm.types import (
     ContentBlockDelta,
@@ -30,6 +30,7 @@ from app.core.llm.types import (
 from app.schemas.content_block import TextBlock
 
 _URL = "https://api.anthropic.com/v1/messages"
+_MODELS_URL = "https://api.anthropic.com/v1/models"
 
 
 def _sse(events: list[dict[str, object]]) -> bytes:
@@ -226,3 +227,64 @@ async def test_stream_raises_on_mid_stream_error_event_after_partial_content() -
     # came through" from "some content came through, then it broke" (see
     # anthropic_adapter.py's module docstring gotcha).
     assert len(received) == 2
+
+
+@respx.mock
+async def test_list_models_follows_pagination() -> None:
+    # WHY two pages: verified live during implementation that GET
+    # /v1/models is cursor-paginated (has_more/last_id, ?after_id=...),
+    # unlike OpenAI/Groq/Together's flat lists — this is the one adapter
+    # that needs a page-loop to be exercised at all.
+    # WHY a side_effect callback, not two params-matched routes: respx's
+    # params matcher isn't reliably an exact/exclusive match across respx
+    # versions — a callback that inspects the actual request is unambiguous.
+    def _paginated(request: httpx.Request) -> httpx.Response:
+        if "after_id" in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [{"id": "claude-haiku-5", "type": "model"}],
+                    "has_more": False,
+                    "first_id": "claude-haiku-5",
+                    "last_id": "claude-haiku-5",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"id": "claude-sonnet-5", "type": "model"}],
+                "has_more": True,
+                "first_id": "claude-sonnet-5",
+                "last_id": "claude-sonnet-5",
+            },
+        )
+
+    respx.get(_MODELS_URL).mock(side_effect=_paginated)
+
+    adapter = AnthropicAdapter(api_key="sk-test")
+    models = await adapter.list_models()
+
+    assert [m.id for m in models] == ["claude-sonnet-5", "claude-haiku-5"]
+    assert models[0].context_window is None
+
+
+@respx.mock
+async def test_list_models_maps_error() -> None:
+    respx.get(_MODELS_URL).mock(
+        return_value=httpx.Response(
+            401,
+            json={
+                "type": "error",
+                "error": {"type": "authentication_error", "message": "bad key"},
+            },
+        )
+    )
+
+    adapter = AnthropicAdapter(api_key="sk-bad")
+    # WHY InternalError, not InvalidRequestError: _ERROR_TYPE_MAP maps
+    # authentication_error to InternalError (our key/account is
+    # misconfigured, not something the caller can fix) — same mapping
+    # stream()'s own error path already uses.
+    with pytest.raises(InternalError) as exc_info:
+        await adapter.list_models()
+    assert exc_info.value.details["provider"] == "anthropic"

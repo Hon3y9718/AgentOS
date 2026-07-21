@@ -1,8 +1,13 @@
-# Static model registry (API_CONTRACT.md §4).
+# Curated model enrichment table (API_CONTRACT.md §4).
 #
-# Loaded and validated once, at process startup (app/core/llm/registry.py) —
-# never fetched from a provider at runtime. `available` and `deprecated_at`
-# from §4's wire shape are computed, not authored here (see registry.py).
+# Loaded and validated once, at process startup (app/core/llm/catalog.py) —
+# this file is NOT the list of models the API can serve. That list is
+# discovered live, per provider, at runtime (see registry.py). This file
+# only supplies capabilities/pricing/display data for models we've
+# verified by hand — a model discovered live but absent here still shows
+# up and is still usable, just with capabilities/pricing reported as
+# unknown (null) rather than fabricated. See registry.py's module
+# docstring for how the two files fit together.
 #
 # WHY four entries, not five: one per provider with a real adapter
 # (Anthropic, OpenAI, Groq, Together). Add a provider's models here only

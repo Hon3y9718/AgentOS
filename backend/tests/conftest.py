@@ -1,19 +1,26 @@
 """Shared test fixtures.
 
-Role: seeds a default DATABASE_URL before app.main (and therefore app.config)
-is imported, and provides a lifespan-aware test client.
+Role: seeds default env vars before app.main (and therefore app.config) is
+imported, and provides a lifespan-aware test client.
 Called by: pytest, auto-discovered. Calls nothing internal beyond app.main.
 Gotcha: test_health_ready hits a real postgres (ARCHITECTURE.md's "Integration"
 tier, not mocked) — `make dev`'s postgres, or CI's service container, must be
 reachable at DATABASE_URL before running `make test`.
+Gotcha: ENABLE_LIVE_MODEL_REFRESH defaults to false here regardless of what a
+developer's real .env sets — app.core.llm.registry's live refresh makes real
+HTTP calls to every configured provider, and `make test` must stay
+deterministic and network-free even when real provider keys are sitting in
+.env for manual smoke testing (this repo's own established convention, per
+the adapter files' "verified live during implementation" comments).
 """
 
 import os
 
 # WHY setdefault before the app.main import below: app/config.py constructs
-# `settings = Settings()` at module import time, so the env var must exist
-# before that import runs, not before the test body runs.
+# `settings = Settings()` at module import time, so these env vars must exist
+# before that import runs, not before any test body runs.
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://agentos:agentos@localhost:5432/agentos")
+os.environ.setdefault("ENABLE_LIVE_MODEL_REFRESH", "false")
 
 from collections.abc import Generator  # noqa: E402
 

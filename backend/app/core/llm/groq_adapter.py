@@ -45,6 +45,7 @@ from app.core.llm.types import (
     LLMRequest,
     LLMUsage,
     MessageDelta,
+    ProviderModel,
     TextBlockStart,
     TextDelta,
     ToolDefinition,
@@ -60,9 +61,13 @@ from app.schemas.content_block import (
 from app.schemas.message import StopReason
 
 _API_URL = "https://api.groq.com/openai/v1/chat/completions"
+_MODELS_URL = "https://api.groq.com/openai/v1/models"
 # WHY read=120.0: matches API_CONTRACT §6's "stream idle timeout: 120s" —
 # same reasoning as anthropic_adapter.py's identical constant.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+# WHY a separate, short timeout for list_models(): see
+# anthropic_adapter.py's identical constant and its WHY comment.
+_MODELS_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
 
 _FINISH_REASON_MAP: dict[str, StopReason] = {
     "stop": "end_turn",
@@ -173,6 +178,23 @@ class GroqAdapter:
                     output_tokens=usage.get("completion_tokens", 0),
                 ),
             )
+
+    async def list_models(self) -> list[ProviderModel]:
+        # GOTCHA: verified live during implementation — GET /openai/v1/models
+        # returns {"object": "list", "data": [{"id", "object", "created",
+        # "owned_by", "active", "context_window", "max_completion_tokens"}]},
+        # a flat (non-paginated) list. Unlike OpenAI's own endpoint, Groq's
+        # DOES report context_window per model — worth passing through.
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        async with httpx.AsyncClient(timeout=_MODELS_TIMEOUT) as client:
+            response = await client.get(_MODELS_URL, headers=headers)
+        if response.status_code >= 400:
+            _raise_for_error_response(response)
+        body = response.json()
+        return [
+            ProviderModel(id=m["id"], context_window=m.get("context_window"))
+            for m in body.get("data", [])
+        ]
 
 
 def _iter_sse_data(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:

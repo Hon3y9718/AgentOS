@@ -1375,3 +1375,536 @@ four provider keys set, confirming each resolves to its own adapter class
   reachable."
 - **The `updated_at` clock-mixing test fragility** — see above; flagged,
   not fixed.
+
+---
+
+## 2026-07-21 — `GET /api/v1/models` (roadmap item 7's cheapest slice)
+
+**Built:** the first of four independent, unstarted "item 7" pieces
+(tools, files, titling, cancellation, plus `GET /api/v1/models`/
+`GET /api/v1/providers/health`, tracked alongside but not numbered as part
+of item 7 itself) — user picked this one for being the smallest and for
+directly unblocking the frontend's hardcoded `default_model`.
+
+1. **`app/schemas/model.py`** — new. `Capabilities`, `Pricing`, `Model`,
+   `ModelList`, matching §4's worked example field-for-field.
+   - **WHY this duplicates `app/core/llm/registry.py`'s same-named
+     `Capabilities`/`Pricing` classes instead of importing them:**
+     `schemas/`'s own README states it plainly — "A leaf package, not a
+     rung above `core/llm/`." `registry.py`'s versions are internal
+     `registry.yaml` validation types (no `available`/`deprecated_at` —
+     those are computed, not authored); this file's versions are the
+     public wire shape. They happen to look identical today because §4's
+     wire shape and the registry file's own shape were designed to match,
+     not because one should import the other.
+   - `ModelList` has no `pagination` field, unlike `ConversationList`/
+     `MessageList` in `pagination.py` — §4's own example response is bare
+     `{"data": [...]}`. Left `ModelList` in `model.py` itself rather than
+     adding it to `pagination.py`, since it doesn't use that file's
+     `Pagination` shape at all.
+
+2. **`app/services/models.py`** — new. `list_models()` filters the
+   in-memory `registry` (no DB session — first service module here that
+   needs none) by `provider` (exact match), `capability` (repeated,
+   ANDed per §4), and `available` (computed from configured API keys, via
+   `registry.is_available()`).
+   - **WHY an unrecognized `provider` or `capability` value returns an
+     empty list instead of `400 invalid_request`:** §4 documents the
+     query params with examples but never specifies error behavior for a
+     value that matches nothing. Chose "matches zero registry entries" as
+     the uniform behavior for both filters — simplest reading, and it
+     meant the capability filter could be a plain `getattr(...,
+     default=False)` with no separate validation branch at all.
+
+3. **`app/api/v1/models.py`** — new, wired into `main.py`'s router list.
+   Requires `CurrentUser` like every other `/api/v1` route, even though
+   the registry isn't per-user data — §1 only explicitly exempts
+   `/health`/`/health/ready` from auth, not this endpoint.
+   - **Hit two real FastAPI/ruff interactions writing the `capability`
+     query param** (a repeatable list, `?capability=tools&capability=vision`):
+     first, `capability: list[str] = Query(default=[])` — the idiomatic
+     FastAPI pattern for a repeatable query param — trips ruff/bugbear's
+     B008 on the mutable `[]` literal (this codebase has no prior example
+     of a *list*-typed `Query` param to have hit this before). Tried
+     `Annotated[list[str], Query(default=[])]` next, matching
+     `deps.py`'s existing `CurrentUser` pattern for `Depends()` — but
+     FastAPI itself rejects that combination outright at import time
+     (`AssertionError: Query default value cannot be set in Annotated for
+     'capability'. Set the default value with = instead`). Landed on
+     `Annotated[list[str] | None, Query()]` with the real default (`=
+     None`) on the parameter itself, then `capability or []` where it's
+     used — `None` is immutable so neither FastAPI nor ruff object, and
+     it's the same "push the call into type metadata" trick `deps.py`
+     already uses, just combined with a plain default this time instead
+     of none at all.
+
+4. **`tests/test_models.py`** — new, integration tier (real ASGI app,
+   `client`/`auth_headers` fixtures) even though no DB is touched, for
+   consistency with every other router's tests and because auth is still
+   required. Covers: full listing, 401 without auth, contract-shape
+   assertions against the anthropic entry, `provider` filter (match and
+   unknown-value-is-empty), `capability` filter (single, ANDed multiple,
+   unknown-value-is-empty), and `available` filtering via the same
+   `monkeypatch.setattr("app.core.llm.registry.settings...")` pattern
+   `test_registry.py` already established.
+
+5. **`app/services/chat.py`'s `_bump_conversation()`** — the pre-existing
+   `updated_at` clock-mixing bug (previous entry) reproduced a third time
+   in this session's own `make test` run (see "Understand before the next
+   step"), no longer explainable as a one-off VM-clock-drift artifact.
+   Asked the user whether to fix it now, despite being outside this
+   session's chosen scope (`GET /api/v1/models`); they said yes. Fix:
+   deleted the line `row.updated_at = datetime.now(UTC).replace(tzinfo=None)`
+   entirely — `app/models/conversation.py`'s `updated_at` column already
+   declares `onupdate=func.now()`, so any ORM-issued UPDATE for this row
+   (message_count is being incremented in the same flush) already sets
+   `updated_at` from Postgres's own clock. The deleted line was silently
+   overriding that server-computed value with the *app* process's clock
+   instead — the one place in the codebase inconsistent with how
+   `conversations.py`'s `update_conversation()` already leaves this column
+   alone and lets `onupdate` handle it.
+
+**Verified:** `make lint` (ruff + mypy) clean. Full `make test` — 89/89,
+including the previously-reproducing `test_chat_bumps_message_count_and_updated_at`,
+re-run standalone afterward to confirm (not just as part of the full suite).
+
+### Understand before the next step
+
+- **FastAPI's own default-value rules for `Annotated` params are stricter
+  than `deps.py`'s existing `Depends()` example suggested.** `Depends()`
+  takes no meaningful "default" of its own, so `Annotated[str,
+  Depends(fn)]` with no `=` at all just works. `Query()` *does* have a
+  `default=` kwarg, and FastAPI asserts you use *one or the other* — a
+  default inside `Query(...)` XOR a default via `=` after the
+  `Annotated[...]`, never both, never neither for a param that needs one.
+  Whichever one is closer to "the FastAPI-recommended way to avoid B008"
+  depends on whether the type itself is immutable (`= None` is always
+  safe) — a mutable-looking default (`= []`) still needs the `Query()`
+  form avoided some other way, which is why this file ended up
+  converting `None` to `[]` in the function body rather than trying to
+  default to `[]` anywhere in the signature.
+- **The `updated_at` clock-mixing bug (previous entry) reproduced
+  identically on a second *and* third `make test` run**, across two
+  sessions, weakening the original "one-time VM-clock-adjustment-on-boot"
+  theory — three occurrences (two with Colima not restarted in between)
+  is a real, reproducible defect, not environmental flakiness. Fixed this
+  session (see item 5 above) rather than re-deferred again.
+- **A column's `onupdate=func.now()` only fires if nothing else in the
+  same flush explicitly sets that column first.** `_bump_conversation()`'s
+  manual `row.updated_at = datetime.now(UTC)...` wasn't redundant with the
+  column's `onupdate` — it was actively *suppressing* it, since SQLAlchemy
+  only applies `onupdate` to columns the flush doesn't already have a
+  pending Python-side value for. Worth remembering before adding a manual
+  timestamp anywhere a column already declares `onupdate=func.now()`:
+  the manual value doesn't get overridden by the DB default, it overrides
+  it.
+
+### Deliberately deferred
+
+- **`GET /api/v1/providers/health`** — tracked alongside this endpoint in
+  ROADMAP.md but not built this session; user picked `/models` specifically
+  over it.
+- **`titling.py`, `tools.py`, `files.py`, cancellation** — the other three
+  independent slices of roadmap item 7, untouched.
+- **Switching `frontend/streamlit_app/api_client.py` off its hardcoded
+  `default_model`** — now unblocked (the endpoint it would call now
+  exists) but not done; the frontend still hardcodes
+  `anthropic:claude-sonnet-4-5`.
+
+---
+
+## 2026-07-21 — Frontend model selector
+
+**Why:** user asked how to change provider/model while running the app,
+and found there was no way to — `create_conversation()` always sent the
+same hardcoded `default_model`, and nothing in `app.py` exposed a choice.
+The backend already fully supported switching (`PATCH .../conversations/{id}`
+takes `default_model`; the just-added `GET /api/v1/models` lists every
+registered model with `available`); only the frontend needed the wiring.
+
+**Built:**
+
+1. **`api_client.py`** — `_DEFAULT_MODEL` renamed to `DEFAULT_MODEL` (no
+   longer private — `app.py` needs it as the selector's initial value
+   before its first `list_models()` call returns) and its WHY comment
+   corrected (it used to say `GET /api/v1/models` "doesn't exist yet",
+   stale since last session). `create_conversation()` now takes
+   `default_model` as a parameter instead of hardcoding it into the
+   request body. New: `list_models()` (thin `GET /api/v1/models` wrapper)
+   and `update_conversation(conversation_id, *, default_model)` (`PATCH`).
+
+2. **`app.py`** — sidebar `st.selectbox("Model", ...)` above "+ New
+   conversation", labeling each option `"{display_name} ({provider})"`
+   plus `" — no API key configured"` when `available` is false (shown,
+   not hidden or disabled — the backend's own error on send is the real
+   validation; duplicating it client-side would be redundant).
+   - **The one real design problem this needed solving:** a single sidebar
+     dropdown has to serve two different intents — "what model should the
+     *next new* conversation use" and "what model should *this already-open*
+     conversation use from now on" — without silently corrupting the
+     second one when the user does something unrelated, like just clicking
+     to view a different conversation. Solved with a two-part rule: (a)
+     clicking a conversation in the list immediately sets
+     `st.session_state.selected_model` to *that* conversation's own
+     `default_model` (falling back to `DEFAULT_MODEL` if it's `None` —
+     the exact "default not set" case the user originally hit), so the
+     dropdown is always truthful about the conversation now open; (b)
+     *after* that sync, if the currently-selected conversation's
+     known `default_model` still disagrees with the dropdown's value, that
+     disagreement can only mean the user just changed the dropdown by hand
+     this render pass — that's the one case that issues a
+     `PATCH`+`st.rerun()`. Switching conversations and changing the model
+     both flow through the same two lines of comparison logic rather than
+     needing separate code paths.
+
+**Verified live, not just compiled** — this is a UI change, so per
+CLAUDE.md's "start the dev server and use the feature in a browser"
+requirement, `python -m py_compile` alone would not have been enough:
+- Rebuilt the `api` container (`docker compose up -d --build api`) — it
+  was still running last session's pre-fix image (17 hours stale),
+  predating both the `/models` endpoint and the `updated_at` clock fix.
+- **Found a real bug in the verification process itself, not the
+  code:** the *first* browser load showed no dropdown at all — no error,
+  no "No models configured" fallback caption either, just the old
+  layout, even after a hard page reload. `app.py`'s source on disk (bind
+  mount) was already correct — confirmed by reading it directly. Root
+  cause: the `streamlit` container's Python process had been running
+  continuously since before this session; Streamlit re-execs the main
+  script's *source* on every rerun, but this suggested some layer of
+  staleness (likely the container's file-watcher never firing across the
+  Docker/colima bind mount, or a cached compiled-script check keyed on a
+  file mtime the container never observed changing) was preventing that
+  from picking up the new code. `docker compose restart streamlit` (a
+  full process restart, not just a script rerun) fixed it immediately —
+  the dropdown appeared on the very next page load.
+- With a genuinely fresh process, drove the real UI end-to-end: opened
+  the dropdown (all four models listed, all marked available — real
+  provider keys are configured), selected `GPT-4o (openai)`, created a
+  new conversation, confirmed the dropdown stayed on GPT-4o for it
+  (proving the click-sync logic didn't reset to some other default), and
+  sent a real message. Got back OpenAI's own live `"You exceeded your
+  current quota"` error, rendered correctly via the existing error-display
+  path — a stronger confirmation than a canned success would have been,
+  since it proves the request round-tripped to the real OpenAI API through
+  the real adapter, not a mock. Then, on that same conversation, switched
+  the dropdown to `Llama 3.3 70B Versatile (groq)`, confirmed the
+  selection persisted (the PATCH-and-resync logic didn't flip back or
+  loop), sent the same message again, and got back a real, correct reply
+  ("I am an instance of the Llama model.") — confirming the mid-conversation
+  model-switch path works, not just the new-conversation path. Deleted the
+  test conversation afterward. Backend `make lint`/`make test` (89/89) also
+  re-run to confirm the frontend-only change didn't regress anything.
+
+### Understand before the next step
+
+- **A long-running Streamlit process (or its container) can silently
+  serve stale code from a bind-mounted volume even though the file on
+  disk is definitely current.** `python -m py_compile` and reading the
+  file's own content are not the same claim as "the running process is
+  executing this version" — for any Docker Compose service backed by a
+  bind mount rather than a rebuilt image (this repo's `streamlit` service
+  deliberately has no Dockerfile — see its own compose comment), a
+  container `restart` (not just a page reload) is the reliable way to
+  force a fresh read, and is worth doing by default before trusting a
+  "nothing changed" result from that service specifically.
+- **A real backend error (OpenAI's quota message) surfacing correctly
+  end-to-end is better verification than a canned success reply would
+  have been** — it's proof the whole chain (frontend → `chat.py` →
+  `_get_adapter()`'s dispatch table → the real `OpenAIAdapter` → OpenAI's
+  actual API → the error-mapping path → back to `st.error`) is real, not
+  a code path that happens to look right.
+
+### Deliberately deferred
+
+- Nothing new — this closed the one gap it set out to close
+  (`default_model` had no UI). `GET /api/v1/providers/health`,
+  `titling.py`, `tools.py`, `files.py`, and cancellation remain untouched,
+  as before.
+
+---
+
+## 2026-07-21 — Live model discovery + per-turn, per-chat model picker
+
+**Why:** user asked "why do we only have 1 model per provider — fetch what
+the provider actually has, show all of them by provider" and, separately,
+"the model selector should work per chat and per turn, not the side
+panel, like Claude/ChatGPT." The first part directly reopens a decision
+this codebase made on purpose — `registry.yaml`/ADR-0002 decision 5/
+`API_CONTRACT.md` §4 all said the model list is static, never fetched from
+providers at runtime, specifically so a provider outage can't change what
+the API claims to support. Told the user that plainly, plus the practical
+snag (no provider's list-models endpoint returns capability flags, and
+only Together returns pricing, as an untrusted float) before doing
+anything — they confirmed the reversal was deliberate, not a
+misunderstanding, and picked the hybrid resolution (curated catalog
+enriches known models; live-discovered-but-uncurated ones still show up
+and are still usable, with `capabilities`/`pricing`/`cost_usd` all `null`
+instead of fabricated). Used `EnterPlanMode` given the size (touches
+architecture, the wire contract, and the frontend) — a Plan-agent review
+of the draft caught two real bugs before any code was written (see
+"Understand before the next step").
+
+**Built — backend:**
+
+1. **Split `registry.yaml`/`registry.py` into `catalog.yaml`/`catalog.py`
+   (curated, static, still crash-loud at import) and a rewritten
+   `registry.py`** (the live merge layer). `ModelRegistry.__init__` seeds
+   every catalog entry into its in-memory dict **synchronously, at
+   construction, no network call** — this is the fix for the bug the
+   Plan-agent review caught: if a catalog-known model's presence depended
+   on a live fetch having already succeeded, `resolve()` (called on every
+   chat message via `chat.py`) could 404 a perfectly good, catalog-known
+   model just because the startup refresh hadn't landed yet. Only
+   `refresh_if_stale()` touches the network — TTL-cached (5 min),
+   single-flighted (`asyncio.Lock`, skip rather than queue behind an
+   in-flight refresh so `GET /api/v1/models` latency stays bounded), and
+   per-provider failures degrade that provider's entries to "stale," never
+   dropping them.
+
+2. **`ProviderAdapter.list_models()`** — new Protocol method (`adapter.py`),
+   implemented in all four adapters against each provider's real endpoint.
+   Also moved the `provider -> adapter class` dispatch dict
+   (`ADAPTER_CLASSES`) from `chat.py` into `adapter.py` itself, since
+   `registry.py`'s refresh now needs the same mapping — one definition,
+   not two that could drift.
+
+3. **`types.ProviderModel`** — `id` + optional `context_window`, no
+   pricing field at all. Verified live (see below) that OpenAI/Anthropic
+   don't return pricing, Groq/Together's endpoints differ in shape from
+   each other and from OpenAI's, and Together's pricing arrives as a
+   float — CLAUDE.md's "money is a decimal string, never a float" rule
+   made the call easy: live-reported pricing never reaches
+   `compute_cost_usd()`, full stop; only the curated catalog can price a
+   turn.
+
+4. **Wire contract widened, in the same change, per `API_CONTRACT.md`'s
+   own rule:** `Model.capabilities`, `Model.pricing`, `Model.context_window`,
+   `Model.max_output_tokens`, and `Usage.cost_usd` are all nullable now.
+   `chat.py`'s one cost-computing call site guards `entry.pricing is not
+   None`. `API_CONTRACT.md` §3.3/§4/§5.1 updated with a second worked
+   example (a live-only model, all-null) and a changelog row;
+   `DECISIONS/0002...md` decision 5 got an **appended** "Update,
+   2026-07-21" note (matching decision 6's own existing convention — never
+   silently rewritten).
+
+5. **`app/config.py`'s `enable_live_model_refresh` flag**, defaulted `True`
+   but forced `False` in `tests/conftest.py` — the second bug the
+   Plan-agent review caught: an unconditional startup refresh would make
+   `make test` fire real (possibly billed) HTTP calls to four providers
+   whenever a developer's real `.env` is loaded, which — per this repo's
+   own "verified live during implementation" convention in the adapter
+   files — is exactly the normal state of this particular `.env`.
+   `main.py`'s lifespan fires the refresh as a tracked background task
+   (`asyncio.create_task` + a module-level set holding a strong reference,
+   not bare fire-and-forget — an untracked task can be garbage-collected
+   mid-flight).
+
+6. **Tests:** `list_models()` contract tests per adapter (respx-mocked,
+   matching each file's existing `stream()` test style — Anthropic's
+   needed a pagination test, the only one of the four); `test_registry.py`
+   rewritten for live-only entries, a failed-provider-keeps-prior-entries
+   case, single-flight behavior, and a canary asserting
+   `refresh_if_stale()` is a no-op when the flag is off; `test_models.py`
+   gained direct unit tests against `_matches()`/`_to_schema()` for a
+   hand-built null-capabilities entry (going through the real HTTP
+   endpoint would have meant mutating the shared process-wide `registry`
+   singleton — test pollution); one `test_chat.py` case confirms a turn
+   against a `pricing=None` model persists `cost_usd: null` without
+   raising, using `monkeypatch.setitem` on the shared registry's
+   `_entries` dict rather than a fresh instance, since `chat.py` imports
+   the module-level singleton directly.
+
+**Built — frontend:** the model picker moved out of the sidebar entirely.
+`api_client.py`: `update_conversation()` removed (nothing needs it once
+nothing PATCHes a conversation's model anymore); `stream_chat_message(...,
+model=...)` sends the model as a required per-turn override
+(`ChatRequest.model`, §5.4 — the backend already supported this, the
+frontend just never used it). `app.py`: an `st.popover` rendered
+immediately before `st.chat_input` (Streamlit pins `chat_input` to the
+viewport bottom regardless of call order, so this ends up sitting right at
+the composer — matching ChatGPT/Claude's placement), models grouped by
+provider under `st.caption` headers, unavailable ones `disabled=True`.
+`st.session_state.selected_model` is a single **session-global** value —
+simplified from an earlier draft that tried to keep it synced per-open-
+conversation (PATCH-and-resync machinery, entirely deleted): real
+ChatGPT/Claude behavior is that the selector doesn't jump around when you
+open a different existing chat, it only changes when you pick something,
+which removed an entire class of "did switching conversations accidentally
+change conversation B's model" bugs by construction. Each assistant
+message now shows a small caption naming the model that produced it
+(`Message.model`, already on the wire — cheap to surface).
+
+**Verified, live, not mocked:**
+- Wrote a throwaway script (`$CLAUDE_JOB_DIR/tmp`, not committed) that
+  imports the real `app.config.settings` and calls each adapter's
+  `list_models()` directly — confirmed all four work against real APIs
+  without ever reading the `.env` file myself (respecting the existing
+  `Read(.env)` deny rule; the *running app's own code* reads the key, I
+  only saw the returned model IDs): Anthropic 10 models (pagination
+  really exercised), OpenAI 125, Groq 15 (with real `context_window`
+  values), Together 273 (bare-array shape confirmed, not `{"data":...}`
+  as most other providers use).
+- Rebuilt the `api` image and restarted `streamlit` (learned last session
+  not to trust a long-running container to pick up code changes on its
+  own), then drove the real browser UI end-to-end: opened the popover,
+  confirmed real provider-grouped, live-discovered models (way beyond the
+  4 catalog entries); picked GPT-4o, sent a message, got OpenAI's own real
+  quota-exceeded error (proof of real routing, not a mock); switched to
+  Groq's curated Llama entry *mid-conversation* without creating a new
+  conversation, sent again, got a real reply ("I am an instance of...");
+  confirmed the model badge under the first (failed) message still read
+  "GPT-4o" while the new message's badge read "Llama 3.3 70B Versatile" —
+  proof per-message model tracking, not just per-turn *sending*, works.
+- Full `make lint` (ruff+mypy) and `make test` (104/104, up from 89)
+  re-run clean after every structural change, not just at the end.
+
+### Understand before the next step
+
+- **A registry/cache that's read synchronously on a hot path must never
+  be allowed to depend on an async warm-up having completed.** The
+  Plan-agent review's catch here (seed the cache at construction, treat
+  "live" as pure enrichment on top) is a pattern worth remembering
+  whenever a "static config" gets a "now also live-refreshed" feature
+  added later — the naive version (live data as the base, static data
+  enriching it) inverts which one is allowed to fail.
+- **Tests that share a long-lived, real-startup-path singleton
+  (`app.core.llm.registry.registry`) need an explicit env-var kill switch
+  for any newly-added background network behavior**, not just careful
+  mocking of the one request under test — `enable_live_model_refresh`
+  exists because `TestClient(app)`'s lifespan really does run on every
+  test using the `client` fixture, and that lifespan now does real I/O
+  by default.
+- **respx's `params=` route matching is not obviously an exact/exclusive
+  match** — first draft of Anthropic's pagination test used two
+  `params=`-matched routes and would have silently served page 1's fixture
+  for both requests (subset matching, not exact). Switched to a
+  `side_effect` callback inspecting the real request instead — worth
+  defaulting to that pattern whenever two mocked responses need to differ
+  based on one query param's presence, rather than trusting route-matching
+  specificity/ordering to sort it out.
+- **OpenAI's `/v1/models` returns every model type the account can see, not
+  just chat-capable ones** — confirmed live (whisper-1, tts-1,
+  text-embedding-ada-002, davinci-002 all showed up in the real response,
+  and therefore in the frontend's picker). Not fixed this session:
+  filtering these out would need an ID-prefix heuristic with no data from
+  OpenAI's API to make it principled, and wasn't part of what was asked.
+  Flagged in ROADMAP.md as a known rough edge, not a bug — picking one and
+  sending still fails safely with a real upstream error, it's just a
+  confusing option to see in the list.
+
+### Deliberately deferred
+
+- **Filtering non-chat models out of OpenAI's live list** — see above,
+  flagged as a rough edge, not attempted.
+- **A background periodic refresh task, instead of TTL-checked-on-read** —
+  noted as an available option in the plan if refresh latency on
+  `GET /api/v1/models` ever becomes a real complaint; not built since
+  nothing today needs it.
+- **`gemini` adapter** — still doesn't exist, so still has no `list_models()`
+  either. Same reasoning as every prior session: additive once an adapter
+  exists to prove out.
+- **Capability enforcement before a provider call, `X-Params-Dropped`** —
+  both pre-existing gaps, untouched, now additionally need to handle
+  `capabilities`/dropped-param reporting for a model whose capabilities
+  are `None` (unknown) rather than assuming every registry entry has real
+  capability data.
+
+---
+
+## 2026-07-21 — Settings page for provider/model selection
+
+**Why:** immediate follow-up request, before the "what's left" backlog:
+"Make a setting page... user should select the provider... on the right
+side of input field show the model selector... showing only models from
+the provider selected in Settings. Default provider is Groq."
+
+**Built, then changed after a real finding:**
+
+1. **`st.navigation`/`st.Page`** (confirmed supported — installed Streamlit
+   is 1.59.2, well past the 1.36 introduction) split `app.py` into "Chat"
+   and "Settings" pages, both plain functions (no separate files needed).
+2. First attempt at "model selector on the right side of the input field":
+   `st.columns([5, 1])` with `st.chat_input` in the wide column and a
+   selectbox (filtered to the Settings-chosen provider) in the narrow one.
+   **This worked exactly as asked** — verified live, selector visibly
+   beside the input, correctly filtered to OpenAI when Settings was set to
+   openai, a real send routed to the real OpenAI API (same account
+   quota-exceeded error as previous sessions, confirming real routing).
+3. **Found a real Streamlit constraint while verifying, not before:**
+   `st.chat_input` only auto-pins to the bottom of the viewport when it
+   is *not* nested inside a layout container like `st.columns`. Confirmed
+   by testing a short vs. slightly-longer conversation — with the
+   selector "beside" it, the composer stopped being sticky and just
+   rendered inline wherever the script placed it, meaning it would scroll
+   out of view on any conversation taller than one screen. Surfaced this
+   concretely (not just in the abstract) to the user with the actual
+   tradeoff, rather than silently picking a side.
+4. **User's resolution, not one of the offered options:** move model
+   selection into Settings entirely — provider *and* model both chosen
+   there (a second, dependent selectbox filtered to the chosen provider) —
+   and leave Chat with no picker at all, just a plain bottom-pinned
+   `st.chat_input`. This sidesteps the pinning problem entirely rather
+   than trading it off, and was explicitly framed as "we will have a
+   focused chat." Rebuilt to this shape; the per-message model-name
+   caption stayed (informational, not a control, so it doesn't reintroduce
+   the clutter the user was steering away from).
+
+**A real, reproducible Streamlit bug found and fixed along the way:** the
+Settings provider selectbox, given `key="selected_provider"` matching a
+session_state variable that was *also* written by plain assignment
+elsewhere in the script (the provider-validity-reset logic, which runs on
+both pages), silently ignored the pre-set session_state value on first
+mount and defaulted to displaying index 0 (`"anthropic"`) — confirmed by
+opening the dropdown and seeing `anthropic` highlighted as "selected"
+internally, not just a stale label, while a caption computed from
+`st.session_state.selected_provider` in the same script run correctly
+said `"groq"`. Root cause not fully diagnosed (Streamlit's own widget/
+session_state reconciliation internals, possibly specific to
+`st.navigation`), but the fix is robust regardless of exact cause: never
+give a widget a `key=` that's *also* a target of plain assignment
+elsewhere. Every such widget now uses its own private key
+(`_provider_widget`, `_model_widget`), an explicit `index=` computed from
+the real semantic session_state variable, and a manual sync-back
+statement right after the widget call. Applied consistently to both the
+provider and (in the abandoned columns design, and briefly in the final
+one) model selectors.
+
+**Verified live, end to end, after the final redesign:** Settings
+defaults to groq with "Llama 3.3 70B Versatile" pre-selected; switching
+the provider dropdown to anthropic correctly repopulated the model
+dropdown and picked "Claude Sonnet 4.5" (`DEFAULT_MODEL`); Chat page
+composer is back to full-width and bottom-pinned, no picker; a real send
+against Anthropic correctly showed "Claude Sonnet 4.5" as the model badge
+under the (failed) response, and a retry surfaced Anthropic's own real
+"Your credit balance is too low" error — an account/billing issue on the
+test API key, not a bug, but still proof the request reached the real
+API. `make lint`/`make test` (104/104, unaffected — this was a
+frontend-only session) re-confirmed clean throughout.
+
+### Understand before the next step
+
+- **A widget's `key=` should be treated as exclusively owned by that
+  widget once assigned — never also write to `st.session_state[key]` from
+  plain application code.** This project had two variables
+  (`selected_provider`, `selected_model`) that were both "the widget's
+  backing state" *and* "a plain semantic variable read/written from
+  multiple functions" at once, and that dual role is what triggered a
+  real, hard-to-diagnose display bug. The fix pattern — private widget
+  key, explicit `index=`, manual sync-back to the real variable name — is
+  worth defaulting to for any future `key`-bound widget in this app that
+  needs its value read or reset from outside the widget's own call site.
+- **Streamlit layout containers change more than visual placement.**
+  `st.chat_input`'s bottom-pinning is tied to being called outside any
+  layout container (`st.columns`, likely also `st.container`/`st.expander`)
+  — nesting it changes its *behavior*, not just where it renders. Worth
+  checking for other Streamlit "special" widgets (has its own documented
+  auto-positioning) before assuming a layout wrapper is purely cosmetic.
+- **Surfacing a real technical tradeoff to the user, concretely, got a
+  better answer than either option offered.** The user's actual choice
+  (Settings-only, no Chat-page picker at all) wasn't one of the two
+  presented — asking rather than picking a default left room for that.
+
+### Deliberately deferred
+
+- Nothing new. Same backlog as the previous entry — this was a direct,
+  immediate follow-up request, not a move down the roadmap.

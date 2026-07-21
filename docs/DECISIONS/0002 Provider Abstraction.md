@@ -153,6 +153,32 @@ request), that check is closer to documentation — confirming the contract's
 stated behavior — than to a live failure detector, unlike the database
 check next to it, which really can fail after a successful boot.
 
+**Update, 2026-07-21 (live model discovery):** the user asked to replace
+"one curated model per provider" with every model each provider's own API
+actually reports, grouped by provider — directly reopening this decision's
+"never fetched from providers at runtime" premise (also stated in
+`API_CONTRACT.md` §4's original text). Confirmed with the user this was a
+deliberate reversal, not an oversight, and resolved the fallout (none of
+the four providers' list-models endpoints return capability flags, and
+only Together returns pricing, as an untrusted float) with a hybrid: the
+crash-loudly-at-import-time rule now applies specifically to a small
+curated *catalog* file (`catalog.yaml`/`catalog.py`, functionally what
+`registry.yaml`/this decision originally described) — a bad checked-in row
+is still an operator mistake worth crashing over. Live per-provider
+discovery is a separate, new concern in `registry.py`, and treats a
+provider being unreachable as normal and non-fatal: `ModelRegistry` seeds
+every catalog entry into its in-memory lookup **synchronously, at
+construction**, so `resolve()`/`is_available()` (called on every chat
+message) never await anything or touch the network — only
+`refresh_if_stale()` does, TTL-cached (5 min) and single-flighted, called
+from `GET /api/v1/models` and once, best-effort, from app startup. A
+provider's failed refresh keeps that provider's last-known-good entries
+rather than dropping them. §5.1's readiness check is unaffected by any of
+this — it was already, and remains, purely about the catalog having loaded,
+never live-refresh state, so `API_CONTRACT.md` §5.1's "does not call
+providers" line is still literally true. Full detail in
+`app/core/llm/registry.py`'s and `catalog.py`'s own module docstrings.
+
 ---
 
 ## Decision 6: `ping` is not a `core/llm` concern
