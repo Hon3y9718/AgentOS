@@ -29,17 +29,66 @@ and any agent runtime that later drives this API programmatically.
 
 ## 1. Authentication
 
-MVP ships with a stub, but the shape is final so nothing has to be retrofitted.
+Email/password. A registered account gets a signed JWT access token, sent on every
+subsequent request:
 
 ```
-Authorization: Bearer <token>
+Authorization: Bearer <jwt>
 ```
 
-- MVP: any token is accepted and resolves to a fixed development user. The dependency
-  that does this resolution is real from day one; only its implementation is fake.
 - Every resource is scoped to the resolved user. Fetching another user's conversation
   returns `404`, never `403` — do not leak existence.
 - The user's identity is **never** taken from the request body or a query parameter.
+- Tokens are stateless and short-lived (1 hour). There is no server-side revocation list —
+  `POST /api/v1/auth/logout` is a client-side no-op (discard the token); it does not
+  invalidate the token against the server. See `docs/DECISIONS/0003 Auth Layering.md`.
+
+### 1.1 Register / login / logout
+
+`POST /api/v1/auth/register` — JSON body, `application/json` like every other endpoint:
+
+```json
+{ "email": "user@example.com", "password": "at least 8 characters" }
+```
+
+`201` response:
+
+```json
+{
+  "id": "user_018f...",
+  "email": "user@example.com",
+  "is_active": true,
+  "is_superuser": false,
+  "is_verified": false,
+  "token_limit": 1000000,
+  "tokens_used": 0
+}
+```
+
+Errors: `409 conflict` (email already registered), `422 validation_error` (password too
+short — currently an 8-character minimum, no other policy).
+
+`POST /api/v1/auth/login` — **`application/x-www-form-urlencoded`, not JSON.** This is
+the one endpoint in the API that isn't JSON-in, and it's deliberate: it's the standard
+OAuth2 password grant shape (`OAuth2PasswordRequestForm`), not a contract inconsistency.
+
+```
+username=user@example.com&password=...
+```
+
+(The field is named `username` even though it holds the email — that's the OAuth2 spec's
+field name, not this API's choice.)
+
+`200` response:
+
+```json
+{ "access_token": "eyJ...", "token_type": "bearer" }
+```
+
+Errors: `401 unauthenticated` (wrong email or password).
+
+`POST /api/v1/auth/logout` — requires a valid `Authorization` header. `200` on success;
+see the stateless-token caveat above for what this does and does not do.
 
 Every authenticated response includes:
 
@@ -49,6 +98,15 @@ X-Request-Id: req_018f...
 
 Clients should surface this in error UI. It is the join key across logs, traces, and
 provider call records.
+
+### 1.2 Token usage limit
+
+Each account has a flat token quota (`token_limit`, returned on register/`token_limit`/
+`tokens_used` fields above). `POST /api/v1/conversations/{id}/messages` (§5.4) checks it
+before starting a turn and increments `tokens_used` by `input_tokens + output_tokens` on
+completion. Once `tokens_used >= token_limit`, further turns fail with
+`402 usage_limit_exceeded` until an operator raises the limit directly (no self-service
+upgrade path or periodic reset exists yet).
 
 ---
 
@@ -90,6 +148,7 @@ freely. `details` is free-form and must never be depended on for control flow.
 | `content_filtered` | 422 | no | Provider refused on safety grounds |
 | `provider_error` | 502 | yes | Upstream returned an error we cannot classify |
 | `provider_unavailable` | 503 | yes | Upstream timeout, connection failure, or overload |
+| `usage_limit_exceeded` | 402 | no | Per-user token quota exhausted (§1) |
 | `internal_error` | 500 | no | Our bug |
 
 Rule: a provider-specific error code must **never** reach the client unmapped. If a new
@@ -578,3 +637,4 @@ types without a coordinated frontend release.
 | 2026-07-19 | Initial contract. Conversations, messages, SSE chat, models, tools, files. |
 | 2026-07-20 | §5.3 messages: cursor list (`order` default `asc`, `include_reasoning`) and truncate-delete fully specified. |
 | 2026-07-20 | Fixed `cost_usd` in §3.3's and §5.5's worked examples (`"0.001584"` → `"0.002556"`) — didn't arithmetically match §4's pricing example for the same model and token counts; doc-internal inconsistency, not a formula change. |
+| 2026-07-21 | §1 replaced the MVP auth stub with real email/password auth (register/login/logout, §1.1) and a per-user token usage limit (§1.2, `402 usage_limit_exceeded` added to §2). |

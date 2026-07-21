@@ -134,3 +134,15 @@ class ProviderUnavailableError(DomainError):
 class InternalError(DomainError):
     type = "internal_error"
     http_status = 500
+
+
+class UsageLimitExceededError(DomainError):
+    # WHY 402, not 403/429: the user IS permitted (unlike permission_denied)
+    # and there is no cadence/reset window to wait out (unlike rate_limited,
+    # whose `retryable: true` + retry_after_seconds semantics would be
+    # actively misleading here — retrying immediately does nothing, and this
+    # MVP has no periodic quota reset). 402 Payment Required is the
+    # established convention for "you've used up your allotment."
+    type = "usage_limit_exceeded"
+    http_status = 402
+    retryable = False

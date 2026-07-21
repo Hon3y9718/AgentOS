@@ -15,7 +15,7 @@ See: docs/API_CONTRACT.md#32-conversation
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import ForeignKey, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -26,11 +26,7 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(primary_key=True)
-    # WHY no ForeignKey to a users table: API_CONTRACT §1 auth is still a
-    # stub ("any token resolves to a fixed development user") — there is no
-    # users table to reference yet. Scoping by user_id from day one is still
-    # required by ARCHITECTURE.md; the FK constraint arrives with real auth.
-    user_id: Mapped[str] = mapped_column(index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
 
     title: Mapped[str | None]
     system_prompt: Mapped[str | None]

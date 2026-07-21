@@ -1,7 +1,8 @@
 # models/
 
-SQLAlchemy tables (ARCHITECTURE.md). `conversation.py`, `message.py`, and
-`idempotency_key.py` are real.
+SQLAlchemy tables (ARCHITECTURE.md). `conversation.py`, `message.py`,
+`idempotency_key.py`, and `user.py` are real. `conversations.user_id` and
+`idempotency_keys.user_id` FK to `users.id`.
 
 ## What lives here
 

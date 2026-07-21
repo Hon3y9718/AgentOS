@@ -32,8 +32,9 @@ those three, not here.
 | 4. Provider abstraction (`core/llm`, registry, first adapter) | ✅ done |
 | 5. Chat endpoint (the core streamed turn) | ✅ done |
 | 6. Remaining providers, tools, files, titling | 🟡 in progress — openai/groq/together adapters wired; gemini + tools/files/titling remain |
-| 7. Frontend (Streamlit MVP) | ✅ done |
+| 7. Frontend (Streamlit MVP) | ✅ done — no login UI yet, see auth gap below |
 | 8. Test coverage (contract fixtures, live smoke) | ⬜ not started |
+| 9. Real auth (email/password, JWT) + per-user token limits | ✅ done |
 
 ## Recommended order
 
@@ -63,6 +64,9 @@ next slice and unblocks the frontend's conversation list early.
 7. **Tools, files, titling, cancellation** — round out the contract. (Idempotency moved
    to item 4 above — done.)
 8. **Test coverage** — contract fixtures per provider, live smoke suite.
+9. ~~**Real auth + per-user token limits**~~ Done 2026-07-21 — see BUILD_LOG and
+   `docs/DECISIONS/0003 Auth Layering.md`. Pulled forward ahead of items 7/8 on
+   direct request, out of the "recommended order"'s original sequencing.
 
 ---
 
@@ -71,8 +75,9 @@ next slice and unblocks the frontend's conversation list early.
 ### Cross-cutting / gaps flagged during exploration
 - [x] `docs/DECISIONS/0002 Provider Abstraction.md` — written alongside the Anthropic
       adapter, per plan. Six numbered decisions; read before touching `core/llm/`.
-- [ ] Real `users` table + FK from `conversations.user_id` (currently unconstrained,
-      per BUILD_LOG's persistence-layer session).
+- [x] Real `users` table + FK from `conversations.user_id`/`idempotency_keys.user_id` —
+      done 2026-07-21 alongside real auth, see BUILD_LOG and
+      `docs/DECISIONS/0003 Auth Layering.md`.
 - [ ] Auto-run `alembic upgrade head` on container startup (currently manual).
 - [ ] uvicorn's own access/startup logs still aren't JSON (needs a custom `log_config`
       passed to uvicorn — app-level structlog output already is).
@@ -175,9 +180,18 @@ next slice and unblocks the frontend's conversation list early.
 - [ ] `GET /api/v1/tools`
 - [ ] `POST /api/v1/conversations/{id}/tool_results`
 - [ ] `POST /api/v1/files`
-- [x] `get_current_user` dependency — MVP stub per §1 (`app/api/v1/deps.py`); real
-      token verification is still deferred, only the Bearer-header shape is real
+- [x] `get_current_user` dependency — real JWT verification via `app.core.auth`, done
+      2026-07-21 (was the MVP stub; see BUILD_LOG and ADR-0003).
+- [x] `POST /api/v1/auth/register`, `/login`, `/logout` — done 2026-07-21, composes
+      fastapi-users' own routers rather than hand-written thin handlers (ADR-0003).
 - [ ] Rate-limit headers + `X-Params-Dropped` / `X-Request-Id` wiring (§6)
+- [ ] **Newly discovered:** frontend (`frontend/streamlit_app/`) still has no login UI
+      or per-session token storage — `api_client.py` keeps using a static
+      `AGENTOS_API_TOKEN` env var, which must now hold a real JWT (obtained manually)
+      instead of an arbitrary string. Deliberately out of scope for the backend auth
+      slice; see BUILD_LOG.
+- [ ] **Newly discovered:** no self-service way to raise a user's `token_limit` — an
+      operator has to update the `users` row directly (no admin endpoint exists).
 
 ### Frontend (Streamlit MVP)
 - [x] `api_client.py` — the only file allowed to talk HTTP to the backend. Sync `httpx`
@@ -243,12 +257,15 @@ next slice and unblocks the frontend's conversation list early.
 
 - Multi-step agent loops (built on `core/llm`'s `tool_use` blocks)
 - Long-running background runs (the `run_id` machinery already threads through §5.5)
-- Multi-tenancy hardening (auth dependency and user-scoping already exist from MVP day 1)
-- Cost governance and budgets
+- Multi-tenancy hardening (real auth + user-scoping now exist, see item 9 above; social
+  login / OAuth backends are the natural next step, fastapi-users supports them without
+  a redesign)
+- Cost governance and budgets — today's per-user quota (item 9) is a flat lifetime
+  counter, not a real budgeting system (no periods, no self-service tiers)
 - Provider failover and routing
 - Server-side tool execution (as opposed to MVP's client-side `tool_results`)
 
 ---
 
-*Last updated: 2026-07-21, after wiring the openai/groq/together adapters into `chat.py`'s
-dispatch table.*
+*Last updated: 2026-07-21, after adding real email/password auth and per-user token
+usage limits.*

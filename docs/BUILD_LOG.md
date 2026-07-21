@@ -1375,3 +1375,135 @@ four provider keys set, confirming each resolves to its own adapter class
   reachable."
 - **The `updated_at` clock-mixing test fragility** — see above; flagged,
   not fixed.
+
+## 2026-07-21 — Real email/password auth + per-user token usage limits
+
+Replaced the MVP auth stub (`get_current_user` always resolving to a
+constant `DEV_USER_ID`) with real accounts: register/login/logout, JWT
+bearer tokens, a real `users` table with FKs from `conversations.user_id`
+and `idempotency_keys.user_id`, and a flat per-user token quota enforced in
+the chat turn flow. This was always the plan — `deps.py`'s own docstring
+said swapping in real verification should touch one file, and both FK
+columns were left unconstrained on purpose, waiting for exactly this.
+
+### Decisions
+
+1. **Library: `fastapi-users[sqlalchemy]`**, chosen over hand-rolled
+   `pyjwt`+`argon2-cffi` — explicit user choice, made after being asked
+   (CLAUDE.md: never add a dependency without asking). Pulls in `pyjwt`,
+   `argon2-cffi`, and `email-validator` transitively; only `python-multipart`
+   needed adding explicitly (fastapi-users' login route parses
+   `OAuth2PasswordRequestForm`, which plain `fastapi` — not
+   `fastapi[standard]` — doesn't bundle).
+2. **Where the library's wiring lives, and how its errors reach the
+   client** — both settled in `docs/DECISIONS/0003 Auth Layering.md`, not
+   repeated here. Short version: a new `app/core/auth/` package (not
+   `app/services/`, which must never import `fastapi`); `app/main.py` gained
+   a second exception handler bridging fastapi-users' `HTTPException`s into
+   the §2 envelope, falling through to FastAPI's default handling for
+   anything it doesn't recognize (so Starlette's own 404/405 are untouched).
+3. **Token strategy: stateless JWT**, 1-hour lifetime, no revocation list —
+   user choice. `POST /auth/logout` is real (requires a valid token) but is
+   a no-op against the backend; it only matters if a cookie transport is
+   ever added.
+4. **Usage limit: flat `token_limit`/`tokens_used` columns on `users`**, no
+   reset period — user choice. Checked in
+   `app/services/chat.py`'s `_validate_and_resolve()` (before the
+   idempotency claim, same rule as the existing bad-conversation/bad-model
+   checks there), incremented atomically (`UPDATE ... SET tokens_used =
+   tokens_used + :n`, not a Python read-modify-write) on each turn's
+   success-path commit, in both the streaming and non-streaming code paths.
+   New error type `usage_limit_exceeded`, `402`, non-retryable — didn't fit
+   `permission_denied` (user IS permitted) or `rate_limited` (implies a
+   cadence/retry window that doesn't exist here).
+5. **User IDs use this repo's `new_id("user")` convention**, not
+   fastapi-users' default UUID — `SQLAlchemyBaseUserTable[str]` is
+   ID-type-agnostic by design (its `id` column is only declared under
+   `TYPE_CHECKING`), so overriding it was a one-line `mapped_column`, not a
+   fight with the library.
+6. **Migration backfill instead of truncation.** The two originally-planned
+   migrations (create `users`, then add the FKs) turned out to be one —
+   autogenerate diffed both at once since the DB had never seen an
+   intermediate state. The dev Postgres already had ~1,100 rows under three
+   stub `user_id` literals (`user_dev`, `some_other_user`,
+   `disconnect_test_user` — all test/dev artifacts, no real data). Rather
+   than truncating `conversations`/`messages`/`idempotency_keys` first (the
+   original plan's stated fallback), the migration backfills one
+   placeholder `users` row per pre-existing distinct `user_id` value via a
+   plain `INSERT ... SELECT DISTINCT ... WHERE NOT IN (SELECT id FROM
+   users)` before adding the FK constraints — non-destructive, and it also
+   means old code still writing `user_id="user_dev"` keeps working against
+   the new schema without a code change. Named the FK constraints
+   explicitly (`fk_conversations_user_id_users`,
+   `fk_idempotency_keys_user_id_users`) — autogenerate's `create_foreign_key(None,
+   ...)` on an *existing* table leaves `downgrade()` with `drop_constraint(None,
+   ...)`, which fails outright; every other FK in this codebase was named by
+   Postgres at `CREATE TABLE` time instead and never hit this.
+
+### Verified
+
+`make lint` (ruff + mypy) clean. Full `make test` run against the real dev
+Postgres (already running via `docker compose up`, not started fresh this
+session): 85 passed, 1 failed. The one failure is the *pre-existing*,
+already-documented `test_chat_bumps_message_count_and_updated_at` clock-skew
+flake (ROADMAP.md's cross-cutting gaps: Postgres `func.now()` vs Python
+`datetime.now(UTC)` on two different machines — this session's sandbox has
+Postgres in a container with real, if now consistently-signed, drift against
+the host running pytest). Confirmed unrelated to this session's diff — it
+doesn't touch `_bump_conversation()` or `updated_at` at all — by reading the
+existing ROADMAP.md/BUILD_LOG.md entries describing the exact same failure
+mode from a prior session, and re-running it in isolation (still fails, same
+symptom). Manually verified the migration's backfill directly against the
+real DB (`psql`: three placeholder `users` rows appeared, `\d conversations`
+shows the named FK) rather than trusting the migration ran cleanly just
+because `alembic upgrade head` exited 0.
+
+### Understand before the next step
+
+- **The real `.env` (not `.env.example`) needs a `SECRET_KEY` line added by
+  hand before the `api` container will boot** — `app/config.py` crashes at
+  import if it's missing, same as `DATABASE_URL`. Not done automatically:
+  Claude is denied `Read` on `.env` (by design, per the scaffolding
+  session), same reason `.env`/`.env.example` reconciliation is already a
+  standing ROADMAP.md gap.
+- **A would-be idempotent replay is rejected once a user is over their
+  limit**, even though replaying an already-completed turn wouldn't consume
+  new tokens. `check_usage_limit()` runs in `_validate_and_resolve()`,
+  before `create_chat_message()`/`prepare_stream()` ever call
+  `idempotency.check_or_claim()` to learn whether the request is a replay —
+  telling the two cases apart would mean resolving idempotency first,
+  inverting the ordering the module's own "don't claim a key for work that
+  isn't going to happen" rule depends on. Accepted as an MVP simplification.
+- **The usage check-then-increment isn't atomic against itself** — two
+  concurrent turns for a user sitting exactly at their limit could both pass
+  `check_usage_limit()` before either commits its `increment_tokens_used()`.
+  The increment itself is race-safe (an atomic SQL `UPDATE`, not
+  read-modify-write), but the *check* is a separate statement/transaction
+  from the *increment* that happens much later (after the full provider
+  call completes) — nothing holds a lock across that gap. Under real
+  concurrent load a user could exceed their limit by one in-flight turn's
+  worth of tokens. Accepted for MVP; a real fix needs either a row lock
+  spanning the whole turn (expensive — turns can take a while) or a
+  reservation/compensation scheme, neither implemented here.
+- **fastapi-users' `SQLAlchemyBaseUserTable` field is `hashed_password`, not
+  `password_hash`** — worth knowing before grepping for the wrong name.
+
+### Deliberately deferred
+
+- **Frontend login UI** — `frontend/streamlit_app/api_client.py` keeps its
+  static `AGENTOS_API_TOKEN` env var; there is no login form, no per-session
+  token storage in `st.session_state`, no token refresh. That var now needs
+  to hold a real JWT (register/login once by hand, e.g. via `curl`, and
+  paste the token in) instead of an arbitrary string — out of scope for this
+  backend-focused slice, flagged in ROADMAP.md.
+- **Email verification and password reset** — `UserManager` has the
+  required secrets wired but no router exposes either flow
+  (`get_verify_router`/`get_reset_password_router` are not mounted). See
+  ADR-0003's "what this ADR deliberately leaves open."
+- **Social login / OAuth backends** — the original ask explicitly deferred
+  this; fastapi-users supports it without a redesign when it's wanted.
+- **Self-service or admin control over `token_limit`** — an operator has to
+  update the `users` row directly today; no endpoint exists to change it.
+- **Periodic quota reset / real budgeting** — `tokens_used` only ever goes
+  up; there's no monthly/period concept, matching the "simple counter, no
+  reset" decision made before writing any code.

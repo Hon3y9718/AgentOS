@@ -14,9 +14,11 @@ import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
+from app.models.user import User as UserModel
 from app.schemas.conversation import Conversation, ConversationCreate
 from app.services import conversations as conversations_service
 
@@ -72,10 +74,27 @@ def _create_conversation(
 
 
 def _create_conversation_for_user(user_id: str) -> Conversation:
+    # WHY ON CONFLICT DO NOTHING before creating the conversation: see the
+    # identical comment in test_conversations.py's version of this helper —
+    # conversations.user_id now FKs to users.id, and this literal user_id is
+    # reused across tests sharing one persistent Postgres.
     async def _run() -> Conversation:
         engine = create_async_engine(settings.database_url)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         async with session_factory() as db:
+            await db.execute(
+                pg_insert(UserModel)
+                .values(
+                    id=user_id,
+                    email=f"{user_id}@test.invalid",
+                    hashed_password="unusable-test-placeholder-hash",
+                    is_active=True,
+                    is_superuser=False,
+                    is_verified=True,
+                )
+                .on_conflict_do_nothing(index_elements=["id"])
+            )
+            await db.commit()
             result = await conversations_service.create_conversation(
                 db, user_id, ConversationCreate(default_model=_MODEL)
             )

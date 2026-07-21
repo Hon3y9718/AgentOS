@@ -10,21 +10,28 @@ failure detector — app.core.llm.registry loads and validates registry.yaml
 at import time (same crash-at-boot pattern as Settings()), so by the time
 this endpoint can run at all, the registry has already loaded successfully.
 See ADR-0002 decision 5.
+Gotcha: this is also the one place fastapi-users' plain HTTPExceptions
+(app/api/v1/auth.py) get bridged into the §2 error envelope — see
+http_exception_handler below and docs/DECISIONS/0003 Auth Layering.md.
 See: docs/API_CONTRACT.md#51-health
 """
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import structlog
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler as default_http_exception_handler
+from fastapi.responses import JSONResponse, Response
+from fastapi_users.router import ErrorCode
 from sqlalchemy import text
 
+from app.api.v1.auth import router as auth_router
 from app.api.v1.chat import router as chat_router
 from app.api.v1.conversations import router as conversations_router
 from app.api.v1.messages import router as messages_router
-from app.core.errors import DomainError
+from app.core.errors import ConflictError, DomainError, RequestValidationError, UnauthenticatedError
 from app.core.llm.registry import registry
 from app.core.telemetry.logging import configure_logging
 from app.core.telemetry.middleware import RequestIDMiddleware
@@ -50,6 +57,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
 
 app = FastAPI(title="AgentOS", lifespan=lifespan)
 app.add_middleware(RequestIDMiddleware)
+app.include_router(auth_router, prefix="/api/v1")
 app.include_router(conversations_router, prefix="/api/v1")
 app.include_router(messages_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
@@ -64,6 +72,70 @@ async def domain_error_handler(request: Request, exc: DomainError) -> JSONRespon
     """
     request_id = getattr(request.state, "request_id", None)
     return JSONResponse(status_code=exc.http_status, content={"error": exc.to_envelope(request_id)})
+
+
+def _map_fastapi_users_exception(exc: HTTPException) -> DomainError | None:
+    """Translate fastapi-users' known HTTPException shapes into DomainError.
+
+    Returns None for anything not recognized (e.g. Starlette's own 404 for
+    an unmatched route) — the caller falls back to FastAPI's default
+    handling for those, unchanged.
+    """
+    detail: Any = exc.detail
+    if isinstance(detail, dict):
+        # WHY only this one dict shape is checked: REGISTER_INVALID_PASSWORD
+        # is the only fastapi-users error whose detail is a dict (see
+        # get_register_router's source) — {"code": ..., "reason": ...}.
+        # RESET_PASSWORD_INVALID_PASSWORD/UPDATE_USER_INVALID_PASSWORD share
+        # the same shape but no router exposing them is mounted (see
+        # app/api/v1/auth.py) — matched anyway for robustness if one ever is.
+        if detail.get("code") in (
+            ErrorCode.REGISTER_INVALID_PASSWORD,
+            ErrorCode.RESET_PASSWORD_INVALID_PASSWORD,
+            ErrorCode.UPDATE_USER_INVALID_PASSWORD,
+        ):
+            return RequestValidationError(
+                str(detail.get("reason") or "Invalid password."),
+                code="auth.invalid_password",
+            )
+        return None
+    if detail == ErrorCode.REGISTER_USER_ALREADY_EXISTS:
+        return ConflictError("An account with this email already exists.", code="auth.email_taken")
+    if detail == ErrorCode.LOGIN_BAD_CREDENTIALS:
+        return UnauthenticatedError("Incorrect email or password.", code="auth.bad_credentials")
+    if exc.status_code == 401:
+        # WHY matched on status code alone, no ErrorCode string: fastapi_users'
+        # Authenticator (behind current_active_user, i.e. every CurrentUser
+        # use — app/api/v1/deps.py) raises HTTPException(401, detail=None)
+        # uniformly for a missing, malformed, expired, or otherwise
+        # unresolvable token (confirmed by reading authenticator.py's
+        # _authenticate() and JWTStrategy.read_token()) — there is no
+        # ErrorCode attached to that path.
+        return UnauthenticatedError("Missing or invalid access token.", code="auth.invalid_token")
+    return None
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> Response:
+    """Bridges fastapi-users' plain HTTPExceptions into the §2 envelope.
+
+    fastapi-users' routers (app/api/v1/auth.py) and its Authenticator
+    dependency (behind CurrentUser) raise plain HTTPException with
+    library-specific detail shapes and status codes that don't match
+    API_CONTRACT §2 (e.g. login failure is 400, not 401) — this mirrors
+    domain_error_handler immediately above for that one library's
+    exceptions. Anything not recognized (Starlette's own 404 for an
+    unmatched route, 405 for a wrong method, etc.) falls through to
+    FastAPI's default HTTPException handling, completely unchanged — this
+    is deliberately narrow, not a catch-all. See docs/DECISIONS/0003.
+    """
+    domain_exc = _map_fastapi_users_exception(exc)
+    if domain_exc is None:
+        return await default_http_exception_handler(request, exc)
+    request_id = getattr(request.state, "request_id", None)
+    return JSONResponse(
+        status_code=domain_exc.http_status, content={"error": domain_exc.to_envelope(request_id)}
+    )
 
 
 @app.get("/health")
