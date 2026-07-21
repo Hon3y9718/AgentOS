@@ -1,9 +1,20 @@
 {
   "permissions": {
-    "allow": [
-      "Bash(make *)", "Bash(pytest *)", "Bash(ruff *)",
-      "Bash(git status)", "Bash(git diff *)", "Bash(uv *)"
-    ],
-    "deny": ["Bash(rm -rf *)", "Read(./.env)"]
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(secrets/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.ssh/**)",
+      "Bash(cat .env*)",
+      "Bash(source .env*)",
+      "Bash(env)",
+      "Bash(printenv*)",
+      "Bash(docker exec *)"
+    ]
+  },
+  "enabledPlugins": {
+    "discord@claude-plugins-official": true
   }
 }

@@ -3,6 +3,18 @@
 Chat backend (FastAPI) + Streamlit MVP UI, becoming an agent runtime.
 Streamlit is disposable — Next.js replaces it. Frontend NEVER imports backend code.
 
+## Learning mode
+This is a learning project. I am reading every line to understand it.
+- Explain *why*, not *what*. Assume I can read Python; I can't read your intent.
+- Every non-obvious choice gets a `WHY:` comment naming the alternative you rejected.
+- Production patterns (timeouts, retries, pooling, graceful shutdown) get a `WHY:`
+  explaining what breaks without them — that's the part I can't infer.
+- After each task, append to `docs/BUILD_LOG.md`: what was built, what decisions were
+  made, what I should understand before the next step, and what you deliberately
+  deferred. Newest entry at the bottom, dated.
+- If you use a library feature I likely haven't seen, one line on what it does.
+- Never write clever code. Boring and explicit beats short.
+
 ## Commands
 - `make dev` – docker compose up (postgres + api + streamlit)
 - `make test` – pytest; must pass before any commit

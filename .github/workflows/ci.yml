@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv sync --directory backend
+      - run: uv run --directory backend ruff check
+      - run: uv run --directory backend ruff format --check
+      - run: uv run --directory backend mypy app
+
+  layering:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check_layering.sh
+
+  test:
+    runs-on: ubuntu-latest
+    # WHY a real postgres service, not a mock: test_health_ready exercises an
+    # actual DB connection (ARCHITECTURE.md's "Integration" tier). Health
+    # checks gate the job on the container actually being ready to accept
+    # connections, not just started.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentos
+          POSTGRES_PASSWORD: agentos
+          POSTGRES_DB: agentos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentos -d agentos"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://agentos:agentos@localhost:5432/agentos
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv sync --directory backend
+      - run: uv run --directory backend pytest

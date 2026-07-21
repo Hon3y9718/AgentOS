@@ -1,0 +1,67 @@
+"""Application configuration.
+
+Role: single source of truth for env-derived config. No `os.getenv` anywhere else
+(scripts/check_layering.sh enforces this in CI).
+Called by: main.py, db/session.py, and anything needing config. Calls nothing internal.
+Gotcha: provider keys are Optional — a missing key disables that provider at the
+registry level later, it must never crash the process.
+See: docs/ARCHITECTURE.md#configuration
+"""
+
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """App-wide configuration loaded from the environment / .env file.
+
+    Raises:
+        pydantic_core.ValidationError: at construction time if a required
+            field (database_url) is missing or malformed.
+    """
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    database_url: str
+    # WHY default here but not on database_url: local dev shouldn't need a value
+    # to get readable console output; prod sets LOG_LEVEL explicitly.
+    log_level: str = "INFO"
+
+    # Individually optional: ARCHITECTURE.md requires a provider with no key
+    # configured to show up as `available: false`, not crash startup.
+    #
+    # WHY AliasChoices with a second, non-canonical name on three of these:
+    # this repo's real .env (not .env.example) predates the provider names
+    # settling and still uses OPEN_AI_API_KEY / CLAUD_API_KEY / GOOGLE_API_KEY
+    # — confirmed directly by the user in chat, since Claude is denied `Read`
+    # on `.env` itself (by design, per the scaffolding session). The
+    # canonical name is listed first and is what `.env.example` documents;
+    # the legacy alias exists only so this specific file keeps working
+    # without being rewritten by hand.
+    openai_api_key: str | None = Field(
+        default=None, validation_alias=AliasChoices("OPENAI_API_KEY", "OPEN_AI_API_KEY")
+    )
+    anthropic_api_key: str | None = Field(
+        default=None, validation_alias=AliasChoices("ANTHROPIC_API_KEY", "CLAUD_API_KEY")
+    )
+    together_api_key: str | None = None
+    groq_api_key: str | None = None
+    gemini_api_key: str | None = Field(
+        default=None, validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    )
+
+
+# WHY module-level (not a lazy factory): importing this module is the startup
+# path. If required config is missing, this raises immediately on `import
+# app.config` — before uvicorn binds a port — instead of on the first request
+# that happens to touch settings.
+settings = Settings()
+
+
+def get_settings() -> Settings:
+    """Return the process-wide Settings singleton.
+
+    Exists as a function (not a bare import) so tests can override it via
+    FastAPI's `app.dependency_overrides[get_settings]`.
+    """
+    return settings

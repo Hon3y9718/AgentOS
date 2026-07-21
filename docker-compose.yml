@@ -1,0 +1,56 @@
+# Local dev stack: postgres + api + streamlit. `make dev` runs this.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: agentos
+      POSTGRES_PASSWORD: agentos
+      POSTGRES_DB: agentos
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432" # published so `make test`/`make migrate` on the host can reach it too
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentos -d agentos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./backend
+    env_file: .env
+    environment:
+      # WHY override DATABASE_URL here instead of relying on .env: inside the
+      # compose network the api container reaches postgres by service name,
+      # not localhost. .env's DATABASE_URL is for host-run tools (pytest,
+      # alembic) where "localhost" is correct.
+      DATABASE_URL: postgresql+asyncpg://agentos:agentos@postgres:5432/agentos
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  streamlit:
+    # WHY no dedicated Dockerfile: CLAUDE.md calls Streamlit disposable —
+    # not worth a multi-stage build for a client getting replaced by Next.js.
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./frontend/streamlit_app:/app
+    environment:
+      # WHY http://api:8000, not api_client.py's localhost:8000 default:
+      # same reasoning as the api service's DATABASE_URL override above —
+      # inside the compose network this container reaches the API by
+      # service name, not localhost. The default is for host-run usage
+      # (e.g. the AppTest verification script run directly on the host).
+      AGENTOS_API_BASE_URL: http://api:8000
+    command: sh -c "pip install --no-cache-dir streamlit httpx && streamlit run app.py --server.address=0.0.0.0"
+    depends_on:
+      - api
+    ports:
+      - "8501:8501"
+
+volumes:
+  postgres_data:

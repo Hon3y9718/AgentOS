@@ -1,0 +1,117 @@
+# Static model registry (API_CONTRACT.md §4).
+#
+# Loaded and validated once, at process startup (app/core/llm/registry.py) —
+# never fetched from a provider at runtime. `available` and `deprecated_at`
+# from §4's wire shape are computed, not authored here (see registry.py).
+#
+# WHY four entries, not five: one per provider with a real adapter
+# (Anthropic, OpenAI, Groq, Together). Add a provider's models here only
+# alongside that provider's adapter — per app/core/llm/README.md, data for
+# a provider with no adapter to serve it is untestable and not worth
+# carrying. gemini has no adapter yet, so it has no entry here either.
+#
+# GOTCHA: pricing/context_window/max_output_tokens below are not
+# independently re-verified against each provider's live pricing page.
+# Money fields feed real billing once usage tracking exists; re-check them
+# before any entry here is used for anything but development. (This GOTCHA
+# originally covered only the Anthropic entry — see BUILD_LOG for the
+# session that copied it forward to the other three.)
+
+models:
+  - id: "anthropic:claude-sonnet-4-5"
+    provider: anthropic
+    display_name: "Claude Sonnet 4.5"
+    family: claude
+    context_window: 200000
+    max_output_tokens: 64000
+    capabilities:
+      streaming: true
+      tools: true
+      parallel_tool_calls: true
+      vision: true
+      json_mode: true
+      structured_output: true
+      reasoning: true
+      prompt_caching: true
+      system_prompt: true
+    pricing:
+      input_per_mtok_usd: "3.00"
+      output_per_mtok_usd: "15.00"
+      cache_read_per_mtok_usd: "0.30"
+
+  - id: "openai:gpt-4o"
+    provider: openai
+    display_name: "GPT-4o"
+    family: gpt-4o
+    context_window: 128000
+    max_output_tokens: 16384
+    capabilities:
+      streaming: true
+      tools: true
+      parallel_tool_calls: true
+      vision: true
+      json_mode: true
+      structured_output: true
+      # WHY false: gpt-4o is not one of OpenAI's reasoning-model family
+      # (the o-series) — no reasoning content block, no reasoning_effort
+      # param support in this adapter.
+      reasoning: false
+      # WHY true: OpenAI applies automatic prompt caching to any request
+      # over ~1024 tokens with no separate opt-in param — unlike
+      # Anthropic's cache_control blocks, nothing in this adapter's request
+      # building requests it explicitly.
+      prompt_caching: true
+      system_prompt: true
+    pricing:
+      input_per_mtok_usd: "2.50"
+      output_per_mtok_usd: "10.00"
+      cache_read_per_mtok_usd: "1.25"
+
+  - id: "groq:llama-3.3-70b-versatile"
+    provider: groq
+    display_name: "Llama 3.3 70B Versatile"
+    family: llama
+    context_window: 128000
+    max_output_tokens: 32768
+    capabilities:
+      streaming: true
+      tools: true
+      parallel_tool_calls: true
+      vision: false
+      json_mode: true
+      # WHY false: Groq's OpenAI-compatible endpoint accepts
+      # response_format but doesn't guarantee strict schema conformance
+      # the way OpenAI's own structured-output mode does.
+      structured_output: false
+      reasoning: false
+      # WHY false: Groq serves open-weights models with no prompt-caching
+      # mechanism in its API at all (no cache_read pricing tier either —
+      # see pricing below).
+      prompt_caching: false
+      system_prompt: true
+    pricing:
+      input_per_mtok_usd: "0.59"
+      output_per_mtok_usd: "0.79"
+
+  - id: "together:meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    provider: together
+    display_name: "Llama 3.3 70B Instruct Turbo"
+    family: llama
+    context_window: 128000
+    max_output_tokens: 8192
+    capabilities:
+      streaming: true
+      tools: true
+      # WHY false, unlike the same base model on Groq: not verified live
+      # for this adapter (see BUILD_LOG) — left conservative rather than
+      # assumed.
+      parallel_tool_calls: false
+      vision: false
+      json_mode: true
+      structured_output: false
+      reasoning: false
+      prompt_caching: false
+      system_prompt: true
+    pricing:
+      input_per_mtok_usd: "0.88"
+      output_per_mtok_usd: "0.88"

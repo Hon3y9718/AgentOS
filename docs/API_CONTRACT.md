@@ -190,7 +190,7 @@ adapter place it correctly.
     "cache_read_tokens": 0,
     "cache_write_tokens": 0,
     "reasoning_tokens": 0,
-    "cost_usd": "0.001584"
+    "cost_usd": "0.002556"
   },
   "created_at": "2026-07-19T09:41:20Z",
   "completed_at": "2026-07-19T09:41:22Z"
@@ -321,18 +321,43 @@ guaranteed once agents start writing. Params: `?limit=20&cursor=...&order=desc`.
 
 ### 5.3 Messages
 
-`GET /api/v1/conversations/{id}/messages` — same cursor pagination.
-`?order=asc` for chronological replay (the chat UI's default), `?include_reasoning=true`
-to include reasoning blocks.
+`GET /api/v1/conversations/{id}/messages`
+
+Query: `?limit=20&cursor=...&order=asc&include_reasoning=false`.
+
+- Cursor pagination works identically to §5.2 (opaque cursor = last-seen message id;
+  uuid7 ids sort chronologically, so no separate `created_at` sort key is needed).
+- `order` defaults to **`asc`** — chronological, oldest first. This is the opposite
+  default from §5.2's conversation list (`desc`), because a transcript reads oldest-first;
+  the chat UI always wants this and would otherwise have to pass it on every call.
+- `include_reasoning` defaults to `false` (§3.1) — reasoning blocks are stripped from
+  each message's `content` list unless set to `true`.
+
+Response — `200`:
+
+```json
+{
+  "data": [ { "...message (§3.3)..." } ],
+  "pagination": { "next_cursor": "msg_018f...", "has_more": true, "limit": 20 }
+}
+```
+
+Errors: `401 unauthenticated` (missing/malformed Bearer header); `404 not_found` if the
+conversation doesn't resolve for this user (absent, soft-deleted, or owned by someone
+else — never `403`, per §1).
 
 `DELETE /api/v1/conversations/{id}/messages/{message_id}` — deletes the message **and
-every message after it**. This is a truncation operation, not a splice; leaving a hole in
-the middle of a transcript produces invalid provider payloads. The response reports what
-was removed:
+every message after it** (ordered by id). This is a truncation operation, not a splice;
+leaving a hole in the middle of a transcript produces invalid provider payloads.
+
+Response — `200`:
 
 ```json
 { "deleted_message_ids": ["msg_018fa...", "msg_018fb..."], "count": 2 }
 ```
+
+Errors: `401 unauthenticated`; `404 not_found` if the conversation doesn't resolve for
+this user, or if `message_id` doesn't exist in that conversation.
 
 This is how "edit and resend" and "regenerate" are implemented client-side: truncate,
 then send a new turn.
@@ -551,3 +576,5 @@ types without a coordinated frontend release.
 | Date | Change |
 |---|---|
 | 2026-07-19 | Initial contract. Conversations, messages, SSE chat, models, tools, files. |
+| 2026-07-20 | §5.3 messages: cursor list (`order` default `asc`, `include_reasoning`) and truncate-delete fully specified. |
+| 2026-07-20 | Fixed `cost_usd` in §3.3's and §5.5's worked examples (`"0.001584"` → `"0.002556"`) — didn't arithmetically match §4's pricing example for the same model and token counts; doc-internal inconsistency, not a formula change. |
